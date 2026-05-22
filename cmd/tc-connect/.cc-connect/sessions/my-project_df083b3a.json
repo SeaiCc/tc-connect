@@ -1,0 +1,64 @@
+{
+  "sessions": {
+    "s1": {
+      "id": "s1",
+      "name": "default",
+      "agent_session_id": "",
+      "history": [
+        {
+          "role": "user",
+          "content": "111",
+          "timestamp": "2026-05-22T14:19:16.78050206+08:00"
+        },
+        {
+          "role": "assistant",
+          "content": "111",
+          "timestamp": "2026-05-22T14:19:34.869349057+08:00"
+        },
+        {
+          "role": "user",
+          "content": "hi",
+          "timestamp": "2026-05-22T14:21:07.164711044+08:00"
+        },
+        {
+          "role": "assistant",
+          "content": "Hello! I'm here to help with your software engineering tasks. What would you like to work on?",
+          "timestamp": "2026-05-22T14:21:12.7612858+08:00"
+        },
+        {
+          "role": "user",
+          "content": "/help",
+          "timestamp": "2026-05-22T14:21:23.786793635+08:00"
+        },
+        {
+          "role": "assistant",
+          "content": "Here's how to use opencode:\n\n**Commands:**\n- `/help` - Get help with using opencode (what you just used!)\n- `/clear` - Clear the conversation context\n- `/undo` - Undo the last action\n\n**How to interact:**\n- Just describe what you want to accomplish (e.g., \"fix this bug\", \"add a new feature\", \"explain this code\")\n- I'll use tools to read files, search code, write/edit code, run commands, etc.\n- I can create/edit files, run tests, search for patterns, and more\n\n**Feedback:**\n- Report issues at https://github.com/anomalyco/opencode/issues\n\nWhat would you like help with?",
+          "timestamp": "2026-05-22T14:21:38.383433355+08:00"
+        },
+        {
+          "role": "user",
+          "content": "/list",
+          "timestamp": "2026-05-22T14:30:36.653639216+08:00"
+        },
+        {
+          "role": "assistant",
+          "content": "Directory contents:\n- `.cc-connect/` (directory)\n- `.config.toml.lock`\n- `config.toml`\n- `feishu.go`\n- `instance_lock.go`\n- `main.go`\n- `plugin_agent_feishu.go`\n- `plugin_agent_opencode.go`\n- `provider.go`\n- `restart_windows.go`\n- `tc-connect` (binary)",
+          "timestamp": "2026-05-22T14:30:51.894971127+08:00"
+        }
+      ],
+      "created_at": "2026-05-22T12:35:02.44661192+08:00",
+      "updated_at": "2026-05-22T14:21:13.348074065+08:00"
+    }
+  },
+  "active_session": {
+    "feishu:oc_ab2f244e1fccd7f09199fafa638484e5:ou_f8a2305b4150507a56628aced98b783d": "s1"
+  },
+  "user_session": {},
+  "counter": 1,
+  "user_meta": {
+    "feishu:oc_ab2f244e1fccd7f09199fafa638484e5:ou_f8a2305b4150507a56628aced98b783d": {
+      "user_name": "ou_f8a2305b4150507a56628aced98b783d",
+      "chat_name": "oc_ab2f244e1fccd7f09199fafa638484e5"
+    }
+  }
+}

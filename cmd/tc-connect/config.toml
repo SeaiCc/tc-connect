@@ -1,0 +1,19 @@
+data_dir = ".cc-connect"
+language = "zh"
+
+[project]
+  name = "my-project"
+  [project.agent]
+    type = "opencode"
+    [project.agent.options]
+      mode = "default"
+      work_dir = "/media/ubuntu/data/gitSourceCode/AIWorkflow/tc-connect"
+
+  [project.platform]
+    type = "feishu"
+    [project.platform.options]
+      app_id = "cli_a9527dd0ee3a5cb2"
+      app_secret = "WbfYjlq7Udftt9TANWIeqccyFJnfAkR3"
+
+[log]
+  level = "debug"
