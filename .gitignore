@@ -2,3 +2,9 @@
 node_modules/
 dist/
 
+# tc-connect
+.cc-connect
+
+# Agent
+OPENCODE.md
+
