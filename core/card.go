@@ -1,6 +1,8 @@
 package core
 
-
+import (
+	"strings"
+)
 // ------------------------- 常量 -------------------------
 
 const CardActionLayoutEqualColumns CardActionLayout = "equal_columns"
@@ -16,6 +18,58 @@ const (
 type Card struct {
 	Header   *CardHeader
 	Elements []CardElement
+}
+
+// 将card转换为不支持富卡片的平台的plain-text 表示
+func (c *Card) RenderText() string {
+	var sb strings.Builder
+
+	if c.Header != nil && c.Header.Title != "" {
+		sb.WriteString("**")
+		sb.WriteString(c.Header.Title)
+		sb.WriteString("**\n\n")
+	}
+
+	for _, elem := range c.Elements {
+		switch e := elem.(type) {
+		case CardMarkdown:
+			sb.WriteString(e.Content)
+			sb.WriteString("\n\n")
+		case CardDivider:
+			sb.WriteString("---\n\n")
+		case CardActions:
+			// Render buttons as a hint line
+			for i, btn := range e.Buttons {
+				if i > 0 {
+					sb.WriteString("  ")
+				}
+				sb.WriteString("[")
+				sb.WriteString(btn.Text)
+				sb.WriteString("]")
+			}
+			sb.WriteString("\n\n")
+		case CardListItem:
+			sb.WriteString(e.Text)
+			sb.WriteString("  [")
+			sb.WriteString(e.BtnText)
+			sb.WriteString("]\n")
+		case CardSelect:
+			sb.WriteString(e.Placeholder)
+			sb.WriteString(": ")
+			for i, opt := range e.Options {
+				if i > 0 {
+					sb.WriteString(" | ")
+				}
+				sb.WriteString(opt.Text)
+			}
+			sb.WriteString("\n\n")
+		case CardNote:
+			sb.WriteString(e.Text)
+			sb.WriteString("\n")
+		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // 带有颜色的卡片头
@@ -150,6 +204,14 @@ func (b *CardBuilder) ListItem(desc, btnText, btnValue string) *CardBuilder {
 func (b *CardBuilder) ListItemBtn(desc, btnText, BtnType, btnValue string) *CardBuilder {
 	b.card.Elements = append(b.card.Elements, CardListItem{
 		Text: desc, BtnText: btnText, BtnType: BtnType, BtnValue: btnValue,
+	})
+	return b
+}
+
+// 类似ListItemBtn但是有额外的回调
+func (b *CardBuilder) ListItemBtnExtra(desc, btnText, btnType, btnValue string, extra map[string]string) *CardBuilder {
+	b.card.Elements = append(b.card.Elements, CardListItem{
+		Text: desc, BtnText: btnText, BtnType: btnType, BtnValue: btnValue, Extra: extra,
 	})
 	return b
 }

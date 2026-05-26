@@ -17,12 +17,41 @@ var configMu sync.Mutex
 var ConfigPath string
 
 type Config struct {
-	DataDir  string        `toml:"data_dir"` // session store directory, default .cc-connect
-	Project  ProjectConfig `toml:"project"`
-	Log      LogConfig     `toml:"log"`
-	Language string        `toml:"language"`
+	DataDir string `toml:"data_dir"` // session store directory, default .tc-connect
 
+	Quiet    *bool           `toml:"quiet,omitempty"`
+	Commands []CommandConfig `toml:"commands"` // 全局自定义 / 命令
+	Project  ProjectConfig   `toml:"project"`
+	Aliases           []AliasConfig           `toml:"aliases"`      // global command aliases
+
+	Log      LogConfig       `toml:"log"`
+	Language string          `toml:"language"`
+
+	Display DisplayConfig `toml:"display"`
+
+	Cron   CronConfig   `toml:"cron"`
 	Bridge BridgeConfig `toml:"bridge"`
+}
+
+// 映射trigger string 到command 
+type AliasConfig struct {
+	Name    string `toml:"name"`    // trigger text (e.g. "帮助")
+	Command string `toml:"command"` // target command (e.g. "/help")
+}
+
+// 定时任务配置
+type CronConfig struct {
+	Silent      *bool  `toml:"silent"`       // suppress cron start notification; default false
+	SessionMode string `toml:"session_mode"` // default session mode: "" or "reuse" (default) or "new_per_run"
+}
+
+// 定义了用户自定义slash 命令,(扩展prompt模板或执行一个shell命令)
+type CommandConfig struct {
+	Name        string `toml:"name"`
+	Description string `toml:"description"`
+	Prompt      string `toml:"prompt"`   // prompt template (mutually exclusive with Exec)
+	Exec        string `toml:"exec"`     // shell command to execute (mutually exclusive with Prompt)
+	WorkDir     string `toml:"work_dir"` // optional: working directory for exec command
 }
 
 // 控制websocket桥接用于外部平台adapters
@@ -34,11 +63,35 @@ type BridgeConfig struct {
 	CORSOrigins []string `toml:"cors_origins,omitempty"` // 允许CORS 域， empty = 没有
 }
 
+// how intermediate messages (thinking, tool output) are shown
+type DisplayConfig struct {
+	ThinkingMessages *bool `toml:"thinking_messages"` // whether thinking messages are shown; default true
+	ThinkingMaxLen   *int  `toml:"thinking_max_len"`  // max chars for thinking messages; 0 = no truncation; default 300
+	ToolMaxLen       *int  `toml:"tool_max_len"`      // max chars for tool use messages; 0 = no truncation; default 500
+	ToolMessages     *bool `toml:"tool_messages"`     // whether tool progress messages are shown; default true
+}
+
 // 绑定一个agent (带有特定的work_dir)
 type ProjectConfig struct {
-	Name     string         `toml:"name"`
-	Agent    AgentConfig    `toml:"agent"`
-	Platform PlatformConfig `toml:"platform"`
+	Name         string             `toml:"name"`
+	Agent        AgentConfig        `toml:"agent"`
+	Platform     PlatformConfig     `toml:"platform"`
+	AutoCompress AutoCompressConfig `toml:"auto_compress"`
+
+	// 在当前会话处于非活动状态达到指定分钟数后，ResetOnIdleMins会自动切换到新的tc-connect会话。
+	// 0 或 nil 表示禁用该行为。
+	ResetOnIdleMins *int  `toml:"reset_on_idle_mins,omitempty"`
+	InjectSender    *bool `toml:"inject_sender,omitempty"` // 发送给agent前 每条消息添加发送者身份
+
+	AdminFrom string `toml:"admin_from,omitempty"` // 逗号分隔的特权用户; "*" = all allowed users
+	Quiet     *bool  `toml:"quiet,omitempty"`
+}
+
+// project 的原子上下文压缩
+type AutoCompressConfig struct {
+	Enabled    *bool `toml:"enabled,omitempty"`      // default false
+	MaxTokens  *int  `toml:"max_tokens,omitempty"`   // estimated token threshold to trigger /compress
+	MinGapMins *int  `toml:"min_gap_mins,omitempty"` // minimum minutes between auto-compress runs (default 30)
 }
 
 type AgentConfig struct {
@@ -55,7 +108,7 @@ type LogConfig struct {
 	Level string `toml:"level"`
 }
 
-func Load() (*Config, error) {
+func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("read config file: %w", err)
@@ -215,4 +268,101 @@ func ListProjects() (string, error) {
 		return "", fmt.Errorf("parse config: %w", err)
 	}
 	return cfg.Project.Name, nil
+}
+
+// 添加全局自定义命令,并持久化到config文件
+func AddCommand(cmd CommandConfig) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for _, c := range cfg.Commands {
+		if c.Name == cmd.Name {
+			return fmt.Errorf("command %q already exists", cmd.Name)
+		}
+	}
+	cfg.Commands = append(cfg.Commands, cmd)
+	return saveConfig(cfg)
+}
+
+// 移除一个全局自定义命令 持久化到config
+func RemoveCommand(name string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	found := false
+	var remaining []CommandConfig
+	for _, c := range cfg.Commands {
+		if c.Name == name {
+			found = true
+		} else {
+			remaining = append(remaining, c)
+		}
+	}
+	if !found {
+		return fmt.Errorf("command %q not found", name)
+	}
+	cfg.Commands = remaining
+	return saveConfig(cfg)
+}
+
+// EffectiveDisplay 解析全局 [display] 以及遗留的 quiet（根级或项目级）。
+// 如果处于静音状态且未在[display]中明确设置thinking_messages / tool_messages，
+// 它们映射为false（与显示前的quiet = true向后兼容）。
+func EffectiveDisplay(cfg *Config, proj *ProjectConfig) (thinkingMessages, toolMessages bool, thinkingMaxLen, toolMaxLen int) {
+	thinkingMessages = true
+	toolMessages = true
+	thinkingMaxLen = 300
+	toolMaxLen = 500
+	if cfg.Display.ThinkingMessages != nil {
+		thinkingMessages = *cfg.Display.ThinkingMessages
+	}
+	if cfg.Display.ToolMessages != nil {
+		toolMessages = *cfg.Display.ToolMessages
+	}
+	if cfg.Display.ThinkingMaxLen != nil {
+		thinkingMaxLen = *cfg.Display.ThinkingMaxLen
+	}
+	if cfg.Display.ToolMaxLen != nil {
+		toolMaxLen = *cfg.Display.ToolMaxLen
+	}
+	if projectQuietEffective(cfg, proj) {
+		if cfg.Display.ThinkingMessages == nil {
+			thinkingMessages = false
+		}
+		if cfg.Display.ToolMessages == nil {
+			toolMessages = false
+		}
+	}
+	return thinkingMessages, toolMessages, thinkingMaxLen, toolMaxLen
+}
+
+// projectQuietEffective 返回此项目是否应用了遗留的静默模式：如果存在显式的//每个项目的静默模式覆盖，则应用该覆盖；否则，应用全局根级的静默模式。
+func projectQuietEffective(cfg *Config, proj *ProjectConfig) bool {
+	if proj.Quiet != nil {
+		return *proj.Quiet
+	}
+	if cfg.Quiet != nil {
+		return *cfg.Quiet
+	}
+	return false
 }

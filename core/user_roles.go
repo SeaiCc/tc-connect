@@ -83,6 +83,18 @@ func (m *UserRoleManager) AllowRate(userID string) (allowed, handled bool) {
 	return rl.Allow(userID), true
 }
 
+// Stop 终止所有针对每个角色的速率限制器 goroutine。接收者为 nil 时安全。
+func (m *UserRoleManager) Stop() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, rl := range m.limiters {
+		rl.Stop()
+	}
+}
+
 type roleEntry struct {
 	roleName string
 	userIDs  map[string]bool // normalized user IDs; nil when wildcard

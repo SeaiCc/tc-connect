@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,6 +124,11 @@ type replyContext struct {
 	sessionKey string
 }
 
+// 包装一层,添加SendCard/ReplyCard等方法
+type interactivePlatform struct {
+	*Platform
+}
+
 type Platform struct {
 	platformName          string
 	domain                string
@@ -201,8 +207,10 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		replayClient:          newFeishuReplayClient(appID, appSecret, domain),
 		encryptKey:            encryptKey,
 	}
-	base.self = base
-	return base, nil
+
+	wrapped := &interactivePlatform{Platform: base}
+	base.self = wrapped
+	return wrapped, nil
 }
 
 // ==================== 公开方法（首字母大写） ====================
@@ -355,6 +363,52 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 			return nil
 		})
 	})
+}
+
+func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachment) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: SendFile: invalid reply context type %T", p.tag(), rctx)
+	}
+
+	fileName := file.FileName
+	if fileName == "" {
+		fileName = "attachment"
+	}
+	fileType := detectFeishuFileType(file.MimeType, fileName)
+	var uploadResp *larkim.CreateFileResp
+	if err := p.withTransientRetry(ctx, "upload file", func() error {
+		return p.withFreshTenantAccessTokenRetry(ctx, "upload file", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
+			req := larkim.NewCreateFileReqBuilder().
+				Body(larkim.NewCreateFileReqBodyBuilder().
+					FileType(fileType).
+					FileName(fileName).
+					File(bytes.NewReader(file.Data)).
+					Build()).
+				Build()
+			var err error
+			uploadResp, err = client.Im.File.Create(ctx, req, options...)
+			if err != nil {
+				return fmt.Errorf("%s: upload file: %w", p.tag(), err)
+			}
+			if !uploadResp.Success() {
+				return fmt.Errorf("%s: upload file code=%d msg=%s", p.tag(), uploadResp.Code, uploadResp.Msg)
+			}
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+	if uploadResp.Data == nil || uploadResp.Data.FileKey == nil {
+		return fmt.Errorf("%s: upload file: no file_key returned", p.tag())
+	}
+
+	fileContent, err := (&larkim.MessageFile{FileKey: *uploadResp.Data.FileKey}).String()
+	if err != nil {
+		return fmt.Errorf("%s: build file message: %w", p.tag(), err)
+	}
+
+	return p.sendMediaMessage(ctx, rc, larkim.MsgTypeFile, fileContent)
 }
 
 // ==================== 私有方法（首字母小写） =============
@@ -981,6 +1035,13 @@ func (p *Platform) removeReaction(messageID, reactionID string) {
 	if !resp.Success() {
 		slog.Debug(p.tag()+": remove reaction failed", "code", resp.Code, "msg", resp.Msg)
 	}
+}
+
+func (p *Platform) sendMediaMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	if p.shouldUseThreadOrReplyAPI(rc) {
+		return p.replyMessage(ctx, rc, msgType, content)
+	}
+	return p.createMessage(ctx, rc.chatID, msgType, content, "send media message")
 }
 
 // ==================== 内部方法(Card相关) ====================
@@ -1612,6 +1673,26 @@ func replaceMentions(text string, mentions []*larkim.Mention) string {
 		}
 	}
 	return text
+}
+
+func detectFeishuFileType(mimeType, fileName string) string {
+	name := strings.ToLower(fileName)
+	switch {
+	case mimeType == "application/pdf" || strings.HasSuffix(name, ".pdf"):
+		return larkim.FileTypePdf
+	case strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".docx"):
+		return larkim.FileTypeDoc
+	case strings.HasSuffix(name, ".xls") || strings.HasSuffix(name, ".xlsx") || strings.HasSuffix(name, ".csv"):
+		return larkim.FileTypeXls
+	case strings.HasSuffix(name, ".ppt") || strings.HasSuffix(name, ".pptx"):
+		return larkim.FileTypePpt
+	case mimeType == "video/mp4" || strings.HasSuffix(name, ".mp4"):
+		return larkim.FileTypeMp4
+	case mimeType == "audio/ogg" || mimeType == "audio/opus" || strings.HasSuffix(name, ".opus"):
+		return larkim.FileTypeOpus
+	default:
+		return larkim.FileTypeStream
+	}
 }
 
 // ==================== 辅助函数/工具函数（消息处理） ====================

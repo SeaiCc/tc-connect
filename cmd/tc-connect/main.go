@@ -13,8 +13,15 @@ import (
 	"strings"
 	"syscall"
 	"tc-connect/config"
+	"time"
 
 	"tc-connect/core"
+)
+
+var (
+	version   = "dev"
+	commit    = "none"
+	buildTime = "unknown"
 )
 
 func main() {
@@ -28,6 +35,8 @@ func main() {
 	configFlag := flag.String("config", "", "path to config file (default: ./config.toml) or ~/.tc-connect/config.toml")
 	flag.Usage = printUsage
 	flag.Parse()
+
+	core.VersionInfo = fmt.Sprintf("cc-connect %s\ncommit: %s\nbuilt: %s", version, commit, buildTime)
 
 	initConfigPath(*configFlag)
 	configPath := config.ConfigPath
@@ -52,7 +61,7 @@ func main() {
 		os.Exit(0)
 	}
 	// 从文件中加载配置
-	cfg, err := config.Load()
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config (%s): %v\n", configPath, err)
 		os.Exit(1)
@@ -116,11 +125,21 @@ func main() {
 	// Wire multi-workspace mode
 	// Wire terminal observation (--observe / [projects.observe])
 	// Wire global custom commands
+	for _, c := range cfg.Commands {
+		engine.AddCommand(c.Name, c.Description, c.Prompt, c.Exec, c.WorkDir, "config")
+	}
 	// Wire command persistence callbacks
+	engine.SetCommandSaveAddFunc(func(name, description, prompt, exec, workDir string) error {
+		return config.AddCommand(config.CommandConfig{Name: name, Description: description, Prompt: prompt, Exec: exec, WorkDir: workDir})
+	})
+	engine.SetCommandSaveDelFunc(func(name string) error {
+		return config.RemoveCommand(name)
+	})
 	// Wire global aliases
 	// Wire banned words
 	// Wire disabled commands (project-level)
 	// Wire admin allowlist for privileged commands
+	engine.SetAdminFrom(proj.AdminFrom)
 	// Wire per-user role-based policies
 	// Wire display truncation settings (includes legacy quiet → display mapping)
 	// Wire local reference normalization / rendering
@@ -138,28 +157,28 @@ func main() {
 		})
 	}
 	// Wire 配置重加载
-	// capturedEngine := engine
-	// capturedProjName := proj.Name
-	// engine.SetConfigReloadFunc(func() (*core.ConfigReloadResult, error) {
-	// 	return reloadConfig(configPath, capturedProjName, capturedEngine)
-	// })
+	capturedEngine := engine
+	capturedProjName := proj.Name
+	engine.SetConfigReloadFunc(func() (*core.ConfigReloadResult, error) {
+		return reloadConfig(configPath, capturedProjName, capturedEngine)
+	})
 
 	// Wire /web command callbacks
 
 	// 开启定时任务
-	// cronStore, err := core.NewCronStore(cfg.DataDir)
-	// if err != nil {
-	// 	slog.Warn("cron store unavailable", "error", err)
-	// }
-	// var cronSched *core.CronScheduler
-	// if cronStore != nil {
-	// 	cronSched = core.NewCronScheduler(cronStore)
-	// 	if cfg.Cron.Silent != nil && *cfg.Cron.Silent {
-	// 		cronSched.SetDefaultSilent(true)
-	// 	}
-	// 	cronSched.RegisterEngine(cfg.Project.Name, engine)
-	// 	engine.SetCronScheduler(cronSched)
-	// }
+	cronStore, err := core.NewCronStore(cfg.DataDir)
+	if err != nil {
+		slog.Warn("cron store unavailable", "error", err)
+	}
+	var cronSched *core.CronScheduler
+	if cronStore != nil {
+		cronSched = core.NewCronScheduler(cronStore)
+		if cfg.Cron.Silent != nil && *cfg.Cron.Silent {
+			cronSched.SetDefaultSilent(true)
+		}
+		cronSched.RegisterEngine(cfg.Project.Name, engine)
+		engine.SetCronScheduler(cronSched)
+	}
 
 	// 开启心跳定时任务
 	// heartbeatSched := core.NewHeartbeatScheduler(cfg.DataDir)
@@ -503,6 +522,89 @@ func buildAgentOptions(dataDir string, proj config.ProjectConfig) map[string]any
 	return opts
 }
 
+func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("reload config: %w", err)
+	}
+
+	result := &core.ConfigReloadResult{}
+
+	// Find the matching project
+	var proj *config.ProjectConfig
+	proj = &cfg.Project
+	if proj == nil {
+		return nil, fmt.Errorf("project %q not found in config", projName)
+	}
+
+	// Reload display config (includes legacy quiet → display mapping)
+	tm, tool, tmlen, toollen := config.EffectiveDisplay(cfg, proj)
+	engine.SetDisplayConfig(core.DisplayCfg{
+		ThinkingMessages: tm,
+		ThinkingMaxLen:   tmlen,
+		ToolMaxLen:       toollen,
+		ToolMessages:     tool,
+	})
+	result.DisplayUpdated = true
+
+	// Reload auto-compress settings
+	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
+		minGap := 30 * time.Minute
+		if proj.AutoCompress.MinGapMins != nil {
+			minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
+		}
+		maxTokens := derefInt(proj.AutoCompress.MaxTokens)
+		if maxTokens <= 0 {
+			maxTokens = 12000
+		}
+		engine.SetAutoCompressConfig(true, maxTokens, minGap)
+	} else {
+		engine.SetAutoCompressConfig(false, 0, 0)
+	}
+	// 永久禁用
+	if proj.ResetOnIdleMins != nil {
+		engine.SetResetOnIdle(time.Duration(*proj.ResetOnIdleMins) * time.Minute)
+	} else {
+		engine.SetResetOnIdle(0)
+	}
+
+	// 永久为true
+	showCtx := true
+	engine.SetShowContextIndicator(showCtx)
+
+	// Reload sender injection
+	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
+
+	// Reload attachment send-back switch
+	// engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
+
+	// Reload custom commands
+	engine.ClearCommands("config")
+	for _, c := range cfg.Commands {
+		engine.AddCommand(c.Name, c.Description, c.Prompt, c.Exec, c.WorkDir, "config")
+	}
+	result.CommandsUpdated = len(cfg.Commands)
+
+	// Reload aliases
+	engine.ClearAliases()
+	for _, a := range cfg.Aliases {
+		engine.AddAlias(a.Name, a.Command)
+	}
+
+	// Reload disabled commands
+	// engine.SetDisabledCommands(proj.DisabledCommands)
+
+	// Reload admin allowlist
+	engine.SetAdminFrom(proj.AdminFrom)
+
+	// Reload per-user role-based policies
+	// 禁用基于用户角色的策略
+	engine.SetUserRoles(nil)
+
+	slog.Info("config reloaded", "project", projName)
+	return result, nil
+}
+
 // 打印使用方式
 func printUsage() {
 	v := "dev"
@@ -568,4 +670,12 @@ Commands:
     path             Print the resolved config file path
 
 `, v, "")
+}
+
+// 返回int变量的引用 或 0 (nil)
+func derefInt(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }

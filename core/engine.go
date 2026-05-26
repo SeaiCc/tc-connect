@@ -1,27 +1,31 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
-
 )
 
 const listPageSize = 20
 
 const maxPlatformMessageLen = 4000
 const maxQueuedMessages = 5 // 限制排队消息的数量以控制内存使用
+
+const defaultHelpGroup = "session"
 
 // main启动时设置以便/version工作
 var VersionInfo string
@@ -54,6 +58,12 @@ type queuedMessage struct {
 	userID        string
 	msgPlatform   string // 用于发送injection的平台名称
 	msgSessionKey string // 用于提取chatID的session key
+}
+
+type ConfigReloadResult struct {
+	DisplayUpdated   bool
+	ProvidersUpdated int
+	CommandsUpdated  int
 }
 
 // 追踪一个运行的agent sesion 及其 权限状态
@@ -176,11 +186,19 @@ type Engine struct {
 	injectSender bool
 	startedAt    time.Time
 
-	displaySaveFunc func(thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error
+	commandSaveAddFunc func(name, description, prompt, exec, workDir string) error
+	commandSaveDelFunc func(name string) error
+
+	displaySaveFunc  func(thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error
+	configReloadFunc func() (*ConfigReloadResult, error)
+
+	aliasSaveAddFunc func(name, command string) error
+	aliasSaveDelFunc func(name string) error
 
 	cronScheduler *CronScheduler
 
 	commands *CommandRegistry
+	skills   *SkillRegistry
 	aliases  map[string]string // trigger -> command (帮助 -> /help)
 	aliasMu  sync.RWMutex
 
@@ -208,8 +226,9 @@ type Engine struct {
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
 
-	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
-	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
+	adminFrom   string           // 逗号分割的特权命令用户ID; "*" = 允许所有用户; "" = deny
+	userRoles   *UserRoleManager // nil = legacy mode (no per-user policies)
+	userRolesMu sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
 
 	rateLimiter *RateLimiter
 	outgoingRL  *OutgoingRateLimiter
@@ -229,15 +248,18 @@ type RestartRequest struct {
 func NewEngine(name string, ag Agent, platform Platform, sessionStorePath string, lang Language) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		name:     name, // 项目名
-		agent:    ag,
-		platform: platform,
-		sessions: NewSessionManager(sessionStorePath),
-		ctx:      ctx,
-		cancel:   cancel,
-		i18n:     NewI18n(lang),
-		platformReady: make(map[Platform]bool),
-		interactiveStates:     make(map[string]*interactiveState),
+		name:              name, // 项目名
+		agent:             ag,
+		platform:          platform,
+		sessions:          NewSessionManager(sessionStorePath),
+		ctx:               ctx,
+		cancel:            cancel,
+		i18n:              NewI18n(lang),
+		commands:          NewCommandRegistry(),
+		skills:            NewSkillRegistry(),
+		platformReady:     make(map[Platform]bool),
+		interactiveStates: make(map[string]*interactiveState),
+		startedAt:         time.Now(),
 	}
 
 	// 不检查AgentType 默认为opencode
@@ -287,6 +309,98 @@ func (e *Engine) SetPlatform(p Platform) {
 	e.platform = p
 }
 
+// 注册一个自定义/ 命令
+func (e *Engine) AddCommand(name, description, prompt, exec, workDir, source string) {
+	e.commands.Add(name, description, prompt, exec, workDir, source)
+}
+
+func (e *Engine) SetCommandSaveAddFunc(fn func(name, description, prompt, exec, workDir string) error) {
+	e.commandSaveAddFunc = fn
+}
+
+func (e *Engine) SetCommandSaveDelFunc(fn func(name string) error) {
+	e.commandSaveDelFunc = fn
+}
+
+func (e *Engine) SetCronScheduler(cs *CronScheduler) {
+	e.cronScheduler = cs
+}
+
+// SetAdminFrom 用于设置特权命令的管理员白名单。
+// "*" 表示所有通过 allow_from 的用户都是管理员。
+// 空字符串表示拒绝所有人执行特权命令。
+func (e *Engine) SetAdminFrom(adminFrom string) {
+	e.userRolesMu.Lock()
+	e.adminFrom = strings.TrimSpace(adminFrom)
+	e.userRolesMu.Unlock()
+}
+
+func (e *Engine) SetConfigReloadFunc(fn func() (*ConfigReloadResult, error)) {
+	e.configReloadFunc = fn
+}
+
+// 重写默认的truncations 设置
+func (e *Engine) SetDisplayConfig(cfg DisplayCfg) {
+	e.display = cfg
+}
+
+// 配置自动上下文压缩
+func (e *Engine) SetAutoCompressConfig(enabled bool, maxTokens int, minGap time.Duration) {
+	e.autoCompressEnabled = enabled
+	e.autoCompressMaxTokens = maxTokens
+	if minGap <= 0 {
+		minGap = 30 * time.Minute
+	}
+	e.autoCompressMinGap = minGap
+}
+
+// SetResetOnIdle 配置用于在长时间不活动后自动轮换会话。
+// 持续时间为零或负数时，该行为将被禁用。
+func (e *Engine) SetResetOnIdle(d time.Duration) {
+	if d <= 0 {
+		e.resetOnIdle = 0
+		return
+	}
+	e.resetOnIdle = d
+}
+
+// SetInjectSender 控制是否在将消息转发给代理之前，将发送者身份（平台和用户 ID） 
+// 添加到每条消息之前。启用后，代理会收到类似以下的前缀行：
+// [cc-connect sender_id=ou_abc123 platform=feishu] 
+// 这使得代理能够识别消息的发送者，并相应地调整行为（例如，个人任务视图、基于角色的访问控制）。
+func (e *Engine) SetInjectSender(v bool) {
+	e.injectSender = v
+}
+
+// 从给定的源中移除所有commands
+func (e *Engine) ClearCommands(source string) {
+	e.commands.ClearSource(source)
+}
+
+// 移除所有别名(用于config reload)
+func (e *Engine) ClearAliases() {
+	e.aliasMu.Lock()
+	defer e.aliasMu.Unlock()
+	e.aliases = make(map[string]string)
+}
+
+// 注册一个别名
+func (e *Engine) AddAlias(name, command string) {
+	e.aliasMu.Lock()
+	defer e.aliasMu.Unlock()
+	e.aliases[name] = command
+}
+
+// SetUserRoles 用于配置基于用户角色的策略。若要禁用，请传入 nil。
+func (e *Engine) SetUserRoles(urm *UserRoleManager) {
+	e.userRolesMu.Lock()
+	defer e.userRolesMu.Unlock()
+	if e.userRoles != nil {
+		e.userRoles.Stop()
+	}
+	e.userRoles = urm
+}
+
 // ======================= Engine Helpers =======================
 
 func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images []ImageAttachment, files []FileAttachment) error {
@@ -325,6 +439,125 @@ func (e *Engine) resolveAlias(content string) string {
 	return content
 }
 
+func (e *Engine) showMemoryFile(p Platform, msg *Message, filePath string, isGlobal bool) {
+	if filePath == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryNotSupported))
+		return
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryEmpty), filePath))
+		return
+	}
+
+	content := string(data)
+	if len([]rune(content)) > 2000 {
+		content = string([]rune(content)[:2000]) + "\n\n... (truncated)"
+	}
+
+	if isGlobal {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryShowGlobal), filePath, content))
+	} else {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryShowProject), filePath, content))
+	}
+}
+
+func (e *Engine) appendMemoryFile(p Platform, msg *Message, filePath, text string) {
+	if filePath == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryNotSupported))
+		return
+	}
+
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		return
+	}
+
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		return
+	}
+	defer f.Close()
+
+	entry := "\n- " + text + "\n"
+	if _, err := f.WriteString(entry); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAdded), filePath))
+}
+
+const tcConnectInstructionMarker = "<!-- tc-connect-instructions -->"
+
+type setupResult int
+
+const (
+	setupOK       setupResult = iota // 写入成功
+	setupExists                      // 已经存在
+	setupNoMemory                    // 不支持memory file
+	setupError                       // 写入错误
+)
+
+// 给agent project 的memroy文件 添加 AgentSystemPrompt(). 返回results
+// 文件名(对于message) 和任意错误
+func (e *Engine) setupMemoryFile() (setupResult, string, error) {
+
+	mp, ok := e.agent.(MemoryFileProvider)
+	if !ok {
+		return setupNoMemory, "", nil
+	}
+
+	filePath := mp.ProjectMemoryFile()
+	if filePath == "" {
+		return setupNoMemory, "", nil
+	}
+
+	baseName := filepath.Base(filePath)
+
+	existing, _ := os.ReadFile(filePath)
+	existingText := string(existing)
+	block := "\n" + tcConnectInstructionMarker + "\n" + AgentSystemPrompt() + "\n"
+	if idx := strings.Index(existingText, tcConnectInstructionMarker); idx >= 0 {
+		if strings.Contains(existingText[idx:], AgentSystemPrompt()) {
+			return setupExists, baseName, nil
+		}
+		updated := strings.TrimRight(existingText[:idx], "\n") + block
+		if err := os.WriteFile(filePath, []byte(updated), 0o644); err != nil {
+			return setupError, baseName, err
+		}
+		return setupOK, baseName, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		return setupError, baseName, err
+	}
+
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return setupError, baseName, err
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(block); err != nil {
+		return setupError, baseName, err
+	}
+
+	return setupOK, baseName, nil
+}
+
+func (e *Engine) diff2html(ctx context.Context, diff []byte, workDir, title string) ([]byte, error) {
+	if _, err := exec.LookPath("diff2html"); err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "diff2html", "-i", "stdin", "-o", "stdout", "--title", title)
+	cmd.Dir = workDir
+	cmd.Stdin = bytes.NewReader(diff)
+	return cmd.Output()
+}
 
 // ======================= 内部方法 =======================
 
@@ -535,6 +768,183 @@ func buildAskQuestionResponse(originalInput map[string]any, questions []UserQues
 	return result
 }
 
+func (e *Engine) getOrCreateDeleteModeState(sessionKey string, p Platform, replyCtx any) *deleteModeState {
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[sessionKey]
+	if !ok || state == nil {
+		state = &interactiveState{platform: p, replyCtx: replyCtx}
+		e.interactiveStates[sessionKey] = state
+	} else {
+		state.platform = p
+		state.replyCtx = replyCtx
+	}
+	e.interactiveMu.Unlock()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.deleteMode == nil {
+		state.deleteMode = &deleteModeState{}
+	}
+	dm := state.deleteMode
+	dm.page = 1
+	dm.phase = "select"
+	dm.hint = ""
+	dm.result = ""
+	dm.selectedIDs = make(map[string]struct{})
+	return dm
+}
+
+func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
+	if switcher, ok := agent.(WorkDirSwitcher); ok {
+		if wd := strings.TrimSpace(switcher.GetWorkDir()); wd != "" {
+			return normalizeWorkspacePath(wd)
+		}
+	}
+	if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
+		if dir := strings.TrimSpace(wd.GetWorkDir()); dir != "" {
+			return normalizeWorkspacePath(dir)
+		}
+	}
+	if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+		if dir := strings.TrimSpace(wd.GetWorkDir()); dir != "" {
+			return normalizeWorkspacePath(dir)
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return normalizeWorkspacePath(cwd)
+	}
+	return ""
+}
+
+func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomCommand, args []string) {
+	if cmd.Exec != "" && !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/"+cmd.Name))
+		return
+	}
+	// If this is an exec command, run shell command directly
+	if cmd.Exec != "" {
+		go e.executeShellCommand(p, msg, cmd, args)
+		return
+	}
+
+	// Otherwise, use prompt template
+	prompt := ExpandPrompt(cmd.Prompt, args)
+
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
+	if !session.TryLock() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+		return
+	}
+
+	slog.Info("executing custom command",
+		"command", cmd.Name,
+		"source", cmd.Source,
+		"user", msg.UserName,
+	)
+
+	msg.Content = prompt
+	go e.processInteractiveMessage(p, msg, session)
+}
+
+// 执行shell并将结果发送给用户
+func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomCommand, args []string) {
+	slog.Info("executing shell command",
+		"command", cmd.Name,
+		"exec", cmd.Exec,
+		"user", msg.UserName,
+	)
+
+	// Expand placeholders in exec command
+	execCmd := ExpandPrompt(cmd.Exec, args)
+
+	// Determine working directory
+	workDir := cmd.WorkDir
+	if workDir == "" {
+		// Default to agent's work_dir if available
+		if e.agent != nil {
+			if agentOpts, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+				workDir = agentOpts.GetWorkDir()
+			}
+		}
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
+	defer cancel()
+
+	// Execute command using the native shell so Windows config commands work too.
+	var shellCmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		shellCmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", execCmd)
+	} else {
+		shellCmd = exec.CommandContext(ctx, "sh", "-c", execCmd)
+	}
+	shellCmd.Dir = workDir
+	envVars := []string{
+		"CC_PROJECT=" + e.name,
+		"CC_SESSION_KEY=" + msg.SessionKey,
+	}
+	// Prepend the cc-connect binary dir on Windows only (native shell fix);
+	// on Unix it would change command resolution for user scripts.
+	if runtime.GOOS == "windows" {
+		if exePath, err := os.Executable(); err == nil {
+			binDir := filepath.Dir(exePath)
+			if curPath := os.Getenv("PATH"); curPath != "" {
+				envVars = append(envVars, "PATH="+binDir+string(filepath.ListSeparator)+curPath)
+			} else {
+				envVars = append(envVars, "PATH="+binDir)
+			}
+		}
+	}
+	shellCmd.Env = MergeEnv(os.Environ(), envVars)
+	output, err := shellCmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandExecTimeout), cmd.Name))
+		return
+	}
+
+	if err != nil {
+		errMsg := string(output)
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandExecError), cmd.Name, truncateStr(errMsg, 1000)))
+		return
+	}
+
+	result := strings.TrimSpace(string(output))
+	if result == "" {
+		result = e.i18n.T(MsgCommandExecSuccess)
+	} else if len(result) > 4000 {
+		result = result[:3997] + "..."
+	}
+
+	e.reply(p, msg.ReplyCtx, result)
+}
+
+func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []string) {
+	prompt := BuildSkillInvocationPrompt(skill, args)
+
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
+	if !session.TryLock() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+		return
+	}
+
+	slog.Info("executing skill",
+		"skill", skill.Name,
+		"source", skill.Source,
+		"user", msg.UserName,
+	)
+
+	msg.Content = prompt
+	go e.processInteractiveMessage(p, msg, session)
+}
+
 // ======================== 内部方法 核心处理流程 ========================
 
 func (e *Engine) handleMessage(p Platform, msg *Message) {
@@ -583,6 +993,13 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// FIXME: Multi-workspace
 	var resolvedWorkspace string
 
+	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
+		if e.handleCommand(p, msg, content) {
+			return
+		}
+		// 未识别 slash 命令 - 作为普通消息回退到agent
+	}
+
 	// 权限申请处理
 	if e.handlePendingPermission(p, msg, content) {
 		return
@@ -592,7 +1009,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	sessions := e.sessions
 	agent := e.agent
 	interactiveKey := msg.SessionKey
-	
+
 	// 尝试锁session
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
@@ -600,7 +1017,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		// 尝试在运行的trun排队消息 - session is busy
 		// 这样当前turn结束后可以立即执行
 		if e.queueMessageForBusySession(p, msg, interactiveKey) {
-			// 竞争保护：processInteractiveMessageWith 中的耗尽循环可能 
+			// 竞争保护：processInteractiveMessageWith 中的耗尽循环可能
 			// 刚刚在我们的 TryLock 失败和队列添加之间完成（会话已解锁）。
 			// 重试 TryLock — 如果成功，则没有人在耗尽队列，因此我们必须自己启动一个处理器。
 			if session.TryLock() {
@@ -631,10 +1048,14 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
 }
 
+func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Session) {
+	e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, msg.SessionKey, "", "")
+}
+
 // 核心交互处理循环, 接收显示agent, ineractiveKey (用于interactiveStates map) 和workDir
 // multi-workspace 可以路由到每个工作区agents. ccSessionKey, 当非空时, 使用环境变量的
 // CC_SESSION_KEY, 否则使用interactiveKey
-func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string) {
+func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, tcSessionKey string) {
 	// session.Unlock 不在此处deffered - 在下面的drain loop 显示调用, 当holding state.mu
 	// 关闭"queue is empty"和"session unlocked" 之间的竞争窗口. deffered 回退 确保
 	// lock 在 early-return paths 释放
@@ -660,7 +1081,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		agentOverride = agent
 	}
 	// 获取交互状态 {agentSesison, platform, replyCtx}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, tcSessionKey)
 
 	// 更新此轮的reply context
 	state.mu.Lock()
@@ -739,8 +1160,8 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 }
 
-// 使用e.agent 启动session, ccSessionKey 当非空时 用于CC_SESSION_KEY 环境注入,否则使用sessionKey
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+// 使用e.agent 启动session,tcSessionKey 当非空时 用于TC_SESSION_KEY 环境注入,否则使用sessionKey
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, tcSessionKey string) *interactiveState {
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
@@ -759,7 +1180,6 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		if !needRecycle {
 			return state
 		}
-		// Tear down the stale agent so we start one that matches the Session below.
 		// 销毁stale agent 然后启动一个以匹配下面的Sesison
 		slog.Info("interactive session mismatch, recycling",
 			"session_key", sessionKey,
@@ -773,16 +1193,16 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		ok = false // 阻止下面读取stale设置
 	}
 
-	ccKey := sessionKey
-	if ccSessionKey != "" {
-		ccKey = ccSessionKey
+	tcKey := sessionKey
+	if tcSessionKey != "" {
+		tcKey = tcSessionKey
 	}
 
 	// 注入per-session 环境变量, agent子进程可以调用 `tc-connect cron add` 等
 	if inj, ok := e.agent.(SessionEnvInjector); ok {
 		envVars := []string{
 			"TC_PROJECT=" + e.name,
-			"TC_SESSION_KEY=" + ccKey,
+			"TC_SESSION_KEY=" + tcKey,
 		}
 		if exePath, err := os.Executable(); err == nil {
 			binDir := filepath.Dir(exePath)
@@ -883,7 +1303,7 @@ func (e *Engine) reply(p Platform, replyCtx any, content string) {
 	_ = e.replyWithError(p, replyCtx, content)
 }
 
-// 使用plain text reply 发送返回消息
+// 不支持InlineButtonSender, 使用plain text reply 发送返回消息
 func (e *Engine) replyWithButtons(p Platform, replyCtx any, content string) {
 	if err := e.waitOutgoing(p); err != nil {
 		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
@@ -1407,6 +1827,131 @@ channelClosed:
 			}
 		}
 	}
+}
+
+func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
+	parts := strings.Fields(raw)
+	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
+	args := parts[1:]
+
+	cmdID := matchPrefix(cmd, builtinCommands)
+
+	// FIXME: diableCmds
+
+	// 特殊命令鉴权
+	if cmdID != "" && privilegedCommands[cmdID] && !e.isAdmin(msg.UserID) {
+		slog.Info("audit: command_blocked",
+			"user_id", msg.UserID, "platform", msg.Platform,
+			"project", e.name, "command", cmdID, "reason", "unauthorized")
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/"+cmdID))
+		return true
+	}
+
+	if cmdID != "" {
+		slog.Info("audit: command_executed",
+			"user_id", msg.UserID, "platform", msg.Platform,
+			"project", e.name, "command", cmdID)
+	}
+
+	switch cmdID {
+	case "new":
+		e.cmdNew(p, msg, args)
+	case "list":
+		e.cmdList(p, msg, args)
+	case "switch":
+		e.cmdSwitch(p, msg, args)
+	case "name":
+		e.cmdName(p, msg, args)
+	case "current":
+		e.cmdCurrent(p, msg)
+	case "status":
+		e.cmdStatus(p, msg)
+	case "usage":
+		e.cmdUsage(p, msg)
+	case "history":
+		e.cmdHistory(p, msg, args)
+	case "allow":
+		e.cmdAllow(p, msg, args)
+	case "model":
+		e.cmdModel(p, msg, args)
+	case "reasoning":
+		e.cmdReasoning(p, msg, args)
+	case "mode":
+		e.cmdMode(p, msg, args)
+	case "lang":
+		e.cmdLang(p, msg, args)
+	case "quiet":
+		e.cmdQuiet(p, msg, args)
+	case "provider":
+		e.cmdProvider(p, msg, args)
+	case "memory":
+		e.cmdMemory(p, msg, args)
+	case "cron":
+		e.cmdCron(p, msg, args)
+	case "heartbeat":
+		e.cmdHeartbeat(p, msg, args)
+	case "compress":
+		e.cmdCompress(p, msg)
+	case "stop":
+		e.cmdStop(p, msg)
+	case "help":
+		e.cmdHelp(p, msg)
+	case "version":
+		e.reply(p, msg.ReplyCtx, VersionInfo)
+	case "commands":
+		e.cmdCommands(p, msg, args)
+	case "skills":
+		e.cmdSkills(p, msg)
+	case "config":
+		e.cmdConfig(p, msg, args)
+	case "doctor":
+		e.cmdDoctor(p, msg)
+	case "upgrade":
+		e.cmdUpgrade(p, msg, args)
+	case "restart":
+		e.cmdRestart(p, msg)
+	case "alias":
+		e.cmdAlias(p, msg, args)
+	case "delete":
+		e.cmdDelete(p, msg, args)
+	// TODO: bind 绑定群聊中的bots
+	case "search":
+		e.cmdSearch(p, msg, args)
+	case "shell":
+		e.cmdShell(p, msg, raw)
+	case "diff":
+		e.cmdDiff(p, msg, raw)
+	case "show":
+		e.cmdShow(p, msg, args)
+	case "dir":
+		e.cmdDir(p, msg, args)
+	// TODO: TTS && workspaceDir
+	case "whoami":
+		e.cmdWhoami(p, msg)
+	case "web":
+		e.cmdWeb(p, msg, args)
+	default:
+		if custom, ok := e.commands.Resolve(cmd); ok {
+			// TODO: 根据角色禁用某些命令
+			slog.Info("audit: command_executed",
+				"user_id", msg.UserID, "platform", msg.Platform,
+				"project", e.name, "command", custom.Name, "type", "custom")
+			e.executeCustomCommand(p, msg, custom, args)
+			return true
+		}
+		if skill := e.skills.Resolve(cmd); skill != nil {
+			// TODO: 禁用命令
+			slog.Info("audit: command_executed",
+				"user_id", msg.UserID, "platform", msg.Platform,
+				"project", e.name, "command", skill.Name, "type", "skill")
+			e.executeSkill(p, msg, skill, args)
+			return true
+		}
+		// Not a tc-connect command — notify user, then fall through to agent
+		e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgUnknownCommand), "/"+cmd))
+		return false
+	}
+	return true
 }
 
 // ======================= 内部方法 Card navigation =======================
@@ -2416,6 +2961,133 @@ func (e *Engine) renderDeleteModeResultCard(dm *deleteModeState) *Card {
 		Build()
 }
 
+func (e *Engine) renderCardForPlatform(p Platform, card *Card) *Card {
+	return e.renderCardForPlatformWorkspace(p, card, "")
+}
+
+func (e *Engine) renderCardForPlatformWorkspace(p Platform, card *Card, workspaceDir string) *Card {
+	if card == nil {
+		return nil
+	}
+	out := &Card{}
+	if card.Header != nil {
+		h := *card.Header
+		out.Header = &h
+	}
+	out.Elements = make([]CardElement, 0, len(card.Elements))
+	for _, elem := range card.Elements {
+		switch v := elem.(type) {
+		case CardMarkdown:
+			content := v.Content
+			if workspaceDir != "" {
+				content = e.renderOutgoingContentForWorkspace(p, v.Content, workspaceDir)
+			}
+			out.Elements = append(out.Elements, CardMarkdown{Content: content})
+		case CardNote:
+			text := v.Text
+			if workspaceDir != "" {
+				text = e.renderOutgoingContentForWorkspace(p, v.Text, workspaceDir)
+			}
+			out.Elements = append(out.Elements, CardNote{Text: text, Tag: v.Tag})
+		case CardListItem:
+			text := v.Text
+			if workspaceDir != "" {
+				text = e.renderOutgoingContentForWorkspace(p, v.Text, workspaceDir)
+			}
+			out.Elements = append(out.Elements, CardListItem{
+				Text:     text,
+				BtnText:  v.BtnText,
+				BtnType:  v.BtnType,
+				BtnValue: v.BtnValue,
+				Extra:    v.Extra,
+			})
+		default:
+			out.Elements = append(out.Elements, elem)
+		}
+	}
+	return out
+}
+
+func (e *Engine) renderModelCard(sessionKey string) *Card {
+	agent := e.agent
+
+	switcher, ok := agent.(ModelSwitcher)
+	if !ok {
+		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
+	}
+
+	fetchCtx, cancel := context.WithTimeout(e.ctx, 3*time.Second)
+	defer cancel()
+	models := switcher.AvailableModels(fetchCtx)
+	current := switcher.GetModel()
+
+	var sb strings.Builder
+	if current == "" {
+		sb.WriteString(e.i18n.T(MsgModelDefault))
+	} else {
+		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
+	}
+
+	var opts []CardSelectOption
+	initVal := ""
+	for i, m := range models {
+		label := m.Name
+		if m.Alias != "" {
+			label = m.Alias + " - " + m.Name
+		} else if m.Desc != "" {
+			label += " — " + m.Desc
+		}
+		val := fmt.Sprintf("act:/model switch %d", i+1)
+		opts = append(opts, CardSelectOption{Text: label, Value: val})
+		if m.Name == current {
+			initVal = val
+		}
+	}
+
+	cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
+		Markdown(sb.String()).
+		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal).
+		Buttons(e.cardBackButton())
+	cb.Note(e.i18n.T(MsgModelUsage))
+	return cb.Build()
+}
+
+func (e *Engine) renderHelpCard() *Card {
+	return e.renderHelpGroupCard(defaultHelpGroup)
+}
+
+func (e *Engine) renderSkillsCard() *Card {
+	skills := e.skills.ListAll()
+	if len(skills) == 0 {
+		return e.simpleCard(e.i18n.T(MsgCardTitleSkills), "purple", e.i18n.T(MsgSkillsEmpty))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(e.i18n.Tf(MsgSkillsTitle, e.agent.Name(), len(skills)))
+	for _, s := range skills {
+		sb.WriteString(fmt.Sprintf("  /%s — %s\n", s.Name, s.Description))
+	}
+
+	return NewCard().Title(e.i18n.T(MsgCardTitleSkills), "purple").
+		Markdown(sb.String()).
+		Note(e.i18n.T(MsgSkillsHint)).
+		Buttons(e.cardBackButton()).
+		Build()
+}
+
+// 使用error card 包装一个renderListCard
+func (e *Engine) renderDirCardSafe(sessionKey string, page int) *Card {
+	card, err := e.renderDirCard(sessionKey, page)
+	if err != nil {
+		return e.simpleCard(e.i18n.T(MsgDirCardTitle), "red", err.Error())
+	}
+	return card
+}
+
+func (e *Engine) renderDirCard(sessionKey string, page int) (*Card, error) {
+	return nil, nil
+}
+
 // ======================== Engine CronJob相关 ========================
 
 // 通过注入同步消息到engine运行一个定时任务, 重构reply context, 处理消息就像用户发送的它
@@ -2946,6 +3618,33 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 	return newSession
 }
 
+func (e *Engine) deleteSingleSession(p Platform, msg *Message, deleter SessionDeleter, matched *AgentSessionInfo) {
+	e.reply(p, msg.ReplyCtx, e.deleteSingleSessionReply(msg, deleter, matched))
+}
+
+func (e *Engine) deleteSingleSessionReply(msg *Message, deleter SessionDeleter, matched *AgentSessionInfo) string {
+	if matched == nil {
+		return ""
+	}
+
+	// Prevent deleting the currently active session
+	activeSession := e.sessions.GetOrCreateActive(msg.SessionKey)
+	if activeSession.GetAgentSessionID() == matched.ID {
+		return e.i18n.T(MsgDeleteActiveDenied)
+	}
+
+	displayName := e.deleteSessionDisplayName(e.sessions, matched)
+
+	if err := deleter.DeleteSession(e.ctx, matched.ID); err != nil {
+		return e.i18n.Tf(MsgFailedToDeleteSession, displayName, err)
+	}
+
+	// Keep local session snapshot aligned with agent-side deletion.
+	e.sessions.DeleteByAgentSessionID(matched.ID)
+	e.sessions.SetSessionName(matched.ID, "")
+	return fmt.Sprintf(e.i18n.T(MsgDeleteSuccess), displayName)
+}
+
 // ======================== Engine 消息相关 ========================
 
 // 从状态中清理排队消息并向排队的message sender都发送错误通知, 当event循环正常退出(EvnetError, channel close)
@@ -3093,7 +3792,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	return true
 }
 
-// 当消息排队但是drain loop 早已退出时调用, 处理所有排队的message, 
+// 当消息排队但是drain loop 早已退出时调用, 处理所有排队的message,
 // 与processInteractiveMessageWith中的drain loop类似，但作为一个独立的goroutine。
 func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir string) {
 	unlocked := false
@@ -3128,6 +3827,47 @@ func (e *Engine) ensureInteractiveStateForQueueing(key string, p Platform, reply
 			replyCtx: replyCtx,
 		}
 	}
+}
+
+// 发送一个卡片(非reply)作为一个新message
+func (e *Engine) sendWithCard(p Platform, replyCtx any, card *Card) {
+	if card == nil {
+		slog.Error("sendWithCard: nil card", "platform", p.Name())
+		return
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+		return
+	}
+	if cs, ok := p.(CardSender); ok {
+		rendered := e.renderCardForPlatform(p, card)
+		if err := cs.SendCard(e.ctx, replyCtx, rendered); err != nil {
+			slog.Error("card send failed", "platform", p.Name(), "error", err)
+		}
+		return
+	}
+	e.send(p, replyCtx, e.renderCardForPlatform(p, card).RenderText())
+}
+
+// 通过CardSender 发送接口card,
+// 对于没有card支持的平台,渲染为plain text (不直接fallback)
+func (e *Engine) replyWithCard(p Platform, replyCtx any, card *Card) {
+	if card == nil {
+		slog.Error("replyWithCard: nil card", "platform", p.Name())
+		return
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+		return
+	}
+	if cs, ok := p.(CardSender); ok {
+		rendered := e.renderCardForPlatform(p, card)
+		if err := cs.ReplyCard(e.ctx, replyCtx, rendered); err != nil {
+			slog.Error("card reply failed", "platform", p.Name(), "error", err)
+		}
+		return
+	}
+	e.reply(p, replyCtx, e.renderCardForPlatform(p, card).RenderText())
 }
 
 // ======================== Engine 上下文相关 ========================
@@ -3318,6 +4058,30 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 		titleSuffix = fmt.Sprintf(" (%d/%d)", qIdx+1, total)
 	}
 
+	// Try card (Feishu/Lark)
+	if supportsCards(p) {
+		cb := NewCard().Title(e.i18n.T(MsgAskQuestionTitle)+titleSuffix, "blue")
+		body := "**" + q.Question + "**"
+		if q.MultiSelect {
+			body += e.i18n.T(MsgAskQuestionMulti)
+		}
+		cb.Markdown(body)
+		for i, opt := range q.Options {
+			desc := opt.Label
+			if opt.Description != "" {
+				desc += " — " + opt.Description
+			}
+			answerData := fmt.Sprintf("askq:%d:%d", qIdx, i+1)
+			cb.ListItemBtnExtra(desc, opt.Label, "default", answerData, map[string]string{
+				"askq_label":    opt.Label,
+				"askq_question": q.Question,
+			})
+		}
+		cb.Note(e.i18n.T(MsgAskQuestionNote))
+		e.sendWithCard(p, replyCtx, cb.Build())
+		return
+	}
+
 	// Plain text fallback
 	var sb strings.Builder
 	sb.WriteString("❓ **")
@@ -3339,7 +4103,6 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 	sb.WriteString(fmt.Sprintf("\n%s", e.i18n.T(MsgAskQuestionNote)))
 	e.send(p, replyCtx, sb.String())
 }
-
 
 func (e *Engine) handlePendingPermission(p Platform, msg *Message, content string) bool {
 	e.interactiveMu.Lock()
@@ -3440,6 +4203,1592 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	pending.resolve()
 
 	return true
+}
+
+func (e *Engine) isAdmin(userID string) bool {
+	e.userRolesMu.RLock()
+	af := e.adminFrom
+	e.userRolesMu.RUnlock()
+	if af == "" {
+		return false
+	}
+	if af == "*" {
+		return true
+	}
+	for _, id := range strings.Split(af, ",") {
+		if strings.EqualFold(strings.TrimSpace(id), userID) {
+			return true
+		}
+	}
+	return false
+}
+
+// ======================== Engine Commands相关 ========================
+
+var builtinCommands = []struct {
+	names []string
+	id    string
+}{
+	{[]string{"new"}, "new"},
+	{[]string{"list", "sessions"}, "list"},
+	{[]string{"switch"}, "switch"},
+	{[]string{"name", "rename"}, "name"},
+	{[]string{"current"}, "current"},
+	{[]string{"status"}, "status"},
+	{[]string{"usage", "quota"}, "usage"},
+	{[]string{"history"}, "history"},
+	{[]string{"allow"}, "allow"},
+	{[]string{"model"}, "model"},
+	{[]string{"reasoning", "effort"}, "reasoning"},
+	{[]string{"mode"}, "mode"},
+	{[]string{"lang"}, "lang"},
+	{[]string{"quiet"}, "quiet"},
+	{[]string{"provider"}, "provider"},
+	{[]string{"memory"}, "memory"},
+	{[]string{"cron"}, "cron"},
+	{[]string{"heartbeat", "hb"}, "heartbeat"},
+	{[]string{"compress", "compact"}, "compress"},
+	{[]string{"stop"}, "stop"},
+	{[]string{"help"}, "help"},
+	{[]string{"version"}, "version"},
+	{[]string{"commands", "command", "cmd"}, "commands"},
+	{[]string{"skills", "skill"}, "skills"},
+	{[]string{"config"}, "config"},
+	{[]string{"doctor"}, "doctor"},
+	{[]string{"upgrade", "update"}, "upgrade"},
+	{[]string{"restart"}, "restart"},
+	{[]string{"alias"}, "alias"},
+	{[]string{"delete", "del", "rm"}, "delete"},
+	{[]string{"bind"}, "bind"},
+	{[]string{"search", "find"}, "search"},
+	{[]string{"shell", "sh", "exec", "run"}, "shell"},
+	{[]string{"show"}, "show"},
+	{[]string{"dir", "cd", "chdir", "workdir"}, "dir"},
+	{[]string{"tts"}, "tts"},
+	{[]string{"workspace", "ws"}, "workspace"},
+	{[]string{"whoami", "myid"}, "whoami"},
+	{[]string{"web"}, "web"},
+	{[]string{"diff"}, "diff"},
+}
+
+// 需要admin_from鉴权的命令
+var privilegedCommands = map[string]bool{
+	"shell":   true,
+	"show":    true,
+	"dir":     true,
+	"restart": true,
+	"upgrade": true,
+	"web":     true,
+	"diff":    true,
+}
+
+// /new 启动新session
+func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
+	sessions, interactiveKey := e.sessions, msg.SessionKey
+
+	slog.Info("cmdNew: cleaning up old session", "session_key", msg.SessionKey)
+	e.cleanupInteractiveState(interactiveKey)
+	slog.Info("cmdNew: cleanup done, creating new session", "session_key", msg.SessionKey)
+
+	// Clear old session's agent session ID so it cannot be resumed
+	old := sessions.GetOrCreateActive(msg.SessionKey)
+	old.SetAgentSessionID("", "")
+	old.ClearHistory()
+	sessions.Save()
+
+	name := ""
+	if len(args) > 0 {
+		name = strings.Join(args, " ")
+	}
+	sessions.NewSession(msg.SessionKey, name)
+	if name != "" {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNewSessionCreatedName), name))
+	} else {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNewSessionCreated))
+	}
+}
+
+func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
+	// 默认Feishu支持Card
+	page := 1
+	if len(args) > 0 {
+		if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
+			page = n
+		}
+	}
+	card, err := e.renderListCard(msg.SessionKey, page)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, err.Error())
+		return
+	}
+	e.replyWithCard(p, msg.ReplyCtx, card)
+}
+
+func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | id_prefix | name>")
+		return
+	}
+	query := strings.TrimSpace(strings.Join(args, " "))
+
+	slog.Info("cmdSwitch: listing agent sessions", "session_key", msg.SessionKey)
+	agent, sessions, interactiveKey := e.agent, e.sessions, msg.SessionKey
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return
+	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
+
+	matched := e.matchSession(agentSessions, sessions, query)
+	if matched == nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
+		return
+	}
+
+	slog.Info("cmdSwitch: cleaning up old session", "session_key", msg.SessionKey)
+	e.cleanupInteractiveState(interactiveKey)
+	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
+
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	session.SetAgentInfo(matched.ID, agent.Name(), matched.Summary)
+	session.ClearHistory()
+	sessions.Save()
+
+	shortID := matched.ID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	displayName := sessions.GetSessionName(matched.ID)
+	if displayName == "" {
+		displayName = matched.Summary
+	}
+	e.reply(p, msg.ReplyCtx,
+		e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount))
+}
+
+func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNameUsage))
+		return
+	}
+
+	agent, sessions := e.agent, e.sessions
+
+	// Check if first arg is a number → naming a specific session by list index
+	var targetID string
+	var name string
+
+	if idx, err := strconv.Atoi(args[0]); err == nil && idx >= 1 {
+		// /name <number> <name...>
+		if len(args) < 2 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNameUsage))
+			return
+		}
+		agentSessions, err := agent.ListSessions(e.ctx)
+		if err != nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			return
+		}
+		agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
+		if idx > len(agentSessions) {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx))
+			return
+		}
+		targetID = agentSessions[idx-1].ID
+		name = strings.Join(args[1:], " ")
+	} else {
+		// /name <name...> → current session
+		session := sessions.GetOrCreateActive(msg.SessionKey)
+		targetID = session.GetAgentSessionID()
+		if targetID == "" {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNameNoSession))
+			return
+		}
+		name = strings.Join(args, " ")
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNameUsage))
+		return
+	}
+
+	sessions.SetSessionName(targetID, name)
+
+	shortID := targetID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNameSet), name, shortID))
+}
+
+func (e *Engine) cmdCurrent(p Platform, msg *Message) {
+	e.replyWithCard(p, msg.ReplyCtx, e.renderCurrentCard(msg.SessionKey))
+}
+
+func (e *Engine) cmdStatus(p Platform, msg *Message) {
+
+	e.replyWithCard(p, msg.ReplyCtx, e.renderStatusCard(msg.SessionKey, msg.UserID))
+}
+
+func (e *Engine) cmdUsage(p Platform, msg *Message) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgUsageNotSupported))
+}
+
+func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
+	if len(args) == 0 && supportsCards(p) {
+		e.replyWithCard(p, msg.ReplyCtx, e.renderHistoryCard(msg.SessionKey))
+		return
+	}
+	if len(args) == 0 {
+		args = []string{"10"}
+	}
+
+	sessions := e.sessions
+	s := sessions.GetOrCreateActive(msg.SessionKey)
+	n := 10
+	if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+		n = v
+	}
+
+	entries := s.GetHistory(n)
+
+	if len(entries) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHistoryEmpty))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📜 History (last %d):\n\n", len(entries)))
+	for _, h := range entries {
+		icon := "👤"
+		if h.Role == "assistant" {
+			icon = "🤖"
+		}
+		content := h.Content
+		if len([]rune(content)) > 200 {
+			content = string([]rune(content)[:200]) + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%s [%s]\n%s\n\n", icon, h.Timestamp.Format("15:04:05"), content))
+	}
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+func (e *Engine) cmdAllow(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgToolAuthNotSupported))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgToolAuthNotSupported))
+}
+
+func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
+	agent, sessions, interactiveKey := e.agent, e.sessions, msg.SessionKey
+
+	// FIXME: 暂时没有那么多模型 保留interface用于后续添加功能
+	switcher, ok := agent.(ModelSwitcher)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelNotSupported))
+		return
+	}
+
+	if len(args) == 0 {
+		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard(msg.SessionKey))
+		return
+	}
+
+	targetInput, ok := parseModelSwitchArgs(args)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelUsage))
+		return
+	}
+
+	target := strings.TrimSpace(targetInput)
+	if modelSwitchNeedsLookup(target) {
+		fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+		defer cancel()
+		models := switcher.AvailableModels(fetchCtx)
+		target = resolveModelSwitchTarget(target, models)
+	}
+
+	// FIXME: NOT SUPPORT AGENT切换模型
+	e.cleanupInteractiveState(interactiveKey)
+
+	s := sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("", "")
+	s.ClearHistory()
+	sessions.Save()
+
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChanged, target))
+}
+
+func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgReasoningNotSupported))
+}
+
+func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {
+	switcher, ok := e.agent.(ModeSwitcher)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModeNotSupported))
+		return
+	}
+
+	if len(args) == 0 {
+		if !supportsCards(p) {
+			current := switcher.GetMode()
+			modes := switcher.PermissionModes()
+			var sb strings.Builder
+			zhLike := e.i18n.IsZhLike()
+			for _, m := range modes {
+				suffix := ""
+				if m.Key == current {
+					if zhLike {
+						suffix = "（当前）"
+					} else {
+						suffix = " (current)"
+					}
+				}
+				if zhLike {
+					sb.WriteString(fmt.Sprintf("**%s**%s — %s\n", m.NameZh, suffix, m.DescZh))
+				} else {
+					sb.WriteString(fmt.Sprintf("**%s**%s — %s\n", m.Name, suffix, m.Desc))
+				}
+			}
+			sb.WriteString(e.modeUsageText(modes))
+
+			var buttons [][]ButtonOption
+			var row []ButtonOption
+			for _, m := range modes {
+				label := m.Name
+				if zhLike {
+					label = m.NameZh
+				}
+				row = append(row, ButtonOption{Text: label, Data: "cmd:/mode " + m.Key})
+				if len(row) >= 2 {
+					buttons = append(buttons, row)
+					row = nil
+				}
+			}
+			if len(row) > 0 {
+				buttons = append(buttons, row)
+			}
+			e.replyWithButtons(p, msg.ReplyCtx, sb.String())
+			return
+		}
+		e.replyWithCard(p, msg.ReplyCtx, e.renderModeCard())
+		return
+	}
+
+	target := strings.ToLower(args[0])
+	switcher.SetMode(target)
+	newMode := switcher.GetMode()
+	appliedLive := e.applyLiveModeChange(msg.SessionKey, newMode)
+
+	if !appliedLive {
+		e.cleanupInteractiveState(msg.SessionKey)
+	}
+
+	modes := switcher.PermissionModes()
+	displayName := newMode
+	zhLike := e.i18n.IsZhLike()
+	for _, m := range modes {
+		if m.Key == newMode {
+			if zhLike {
+				displayName = m.NameZh
+			} else {
+				displayName = m.Name
+			}
+			break
+		}
+	}
+	reply := fmt.Sprintf(e.i18n.T(MsgModeChanged), displayName)
+	if appliedLive {
+		reply += "\n\n(Current session updated immediately.)"
+	}
+	e.reply(p, msg.ReplyCtx, reply)
+}
+
+func (e *Engine) cmdLang(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		cur := e.i18n.CurrentLang()
+		name := langDisplayName(cur)
+		text := e.i18n.Tf(MsgLangCurrent, name)
+		if supportsCards(p) {
+			e.replyWithCard(p, msg.ReplyCtx, e.renderLangCard())
+			return
+		}
+		var sb strings.Builder
+		sb.WriteString(text)
+		sb.WriteString("\n\n")
+		sb.WriteString("- English: `/lang en`\n")
+		sb.WriteString("- 中文: `/lang zh`\n")
+		sb.WriteString("- 繁體中文: `/lang zh-TW`\n")
+		sb.WriteString("- 日本語: `/lang ja`\n")
+		sb.WriteString("- Español: `/lang es`\n")
+		sb.WriteString("- Auto: `/lang auto`")
+		e.reply(p, msg.ReplyCtx, sb.String())
+		return
+	}
+
+	target := strings.ToLower(strings.TrimSpace(args[0]))
+	var lang Language
+	switch target {
+	case "en", "english":
+		lang = LangEnglish
+	case "zh", "cn", "chinese", "中文":
+		lang = LangChinese
+	case "zh-tw", "zh_tw", "zhtw", "繁體", "繁体":
+		lang = LangTraditionalChinese
+	case "ja", "jp", "japanese", "日本語":
+		lang = LangJapanese
+	case "auto":
+		lang = LangAuto
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgLangInvalid))
+		return
+	}
+
+	e.i18n.SetLang(lang)
+	name := langDisplayName(lang)
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgLangChanged, name))
+}
+
+func (e *Engine) cmdQuiet(p Platform, msg *Message, args []string) {
+	// ThinkingMessages 和 ToolMessage 的静音toggle
+	isQuiet := e.display.ThinkingMessages || e.display.ToolMessages
+	e.display.ThinkingMessages = !isQuiet
+	e.display.ToolMessages = !isQuiet
+
+	if e.displaySaveFunc != nil {
+		tm := e.display.ThinkingMessages
+		tool := e.display.ToolMessages
+		if err := e.displaySaveFunc(&tm, nil, nil, &tool); err != nil {
+			slog.Error("failed to persist display config after /quiet", "error", err)
+		}
+	}
+
+	if isQuiet {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgQuietOn))
+	} else {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgQuietOff))
+	}
+}
+
+func (e *Engine) cmdProvider(p Platform, msg *Message, arg []string) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProviderNotSupported))
+}
+
+func (e *Engine) cmdMemory(p Platform, msg *Message, args []string) {
+	mp, ok := e.agent.(MemoryFileProvider)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryNotSupported))
+		return
+	}
+
+	if len(args) == 0 {
+		// /memory — show project memory
+		e.showMemoryFile(p, msg, mp.ProjectMemoryFile(), false)
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"add", "global", "show", "help"})
+	switch sub {
+	case "add":
+		text := strings.TrimSpace(strings.Join(args[1:], " "))
+		if text == "" {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+			return
+		}
+		e.appendMemoryFile(p, msg, mp.ProjectMemoryFile(), text)
+
+	case "global":
+		if len(args) == 1 {
+			// /memory global — show global memory
+			e.showMemoryFile(p, msg, mp.GlobalMemoryFile(), true)
+			return
+		}
+		if strings.ToLower(args[1]) == "add" {
+			text := strings.TrimSpace(strings.Join(args[2:], " "))
+			if text == "" {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+				return
+			}
+			e.appendMemoryFile(p, msg, mp.GlobalMemoryFile(), text)
+		} else {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+		}
+
+	case "show":
+		e.showMemoryFile(p, msg, mp.ProjectMemoryFile(), false)
+
+	case "help", "--help", "-h":
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+	}
+}
+
+func (e *Engine) cmdCron(p Platform, msg *Message, args []string) {
+	if e.cronScheduler == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronNotAvailable))
+		return
+	}
+
+	if len(args) == 0 {
+		if !supportsCards(p) {
+			slog.Debug("cmdCron:: Do not support Card")
+			e.cmdCronList(p, msg)
+			return
+		}
+		e.replyWithCard(p, msg.ReplyCtx, e.renderCronCard(msg.SessionKey, msg.UserID))
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{
+		"add", "addexec", "list", "del", "delete", "rm", "remove", "enable", "disable", "mute", "unmute", "setup",
+	})
+	switch sub {
+	case "add":
+		e.cmdCronAdd(p, msg, args[1:])
+	case "addexec":
+		e.cmdCronAddExec(p, msg, args[1:])
+	case "list":
+		e.cmdCronList(p, msg)
+	case "del", "delete", "rm", "remove":
+		e.cmdCronDel(p, msg, args[1:])
+	case "enable":
+		e.cmdCronToggle(p, msg, args[1:], true)
+	case "disable":
+		e.cmdCronToggle(p, msg, args[1:], false)
+	case "mute":
+		e.cmdCronMute(p, msg, args[1:], true)
+	case "unmute":
+		e.cmdCronMute(p, msg, args[1:], false)
+	case "setup":
+		e.cmdCronSetup(p, msg)
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronUsage))
+	}
+}
+
+func (e *Engine) cmdCronList(p Platform, msg *Message) {
+	jobs := e.cronScheduler.Store().ListBySessionKey(msg.SessionKey)
+	if len(jobs) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronEmpty))
+		return
+	}
+
+	lang := e.i18n.CurrentLang()
+	now := time.Now()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(e.i18n.T(MsgCronListTitle), len(jobs)))
+	sb.WriteString("\n")
+	sb.WriteString("\n")
+
+	for i, j := range jobs {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+
+		status := "✅"
+		if !j.Enabled {
+			status = "⏸"
+		}
+		desc := j.Description
+		if desc == "" {
+			if j.IsShellJob() {
+				desc = "🖥 " + truncateStr(j.Exec, 60)
+			} else {
+				desc = truncateStr(j.Prompt, 60)
+			}
+		}
+		if j.Mute {
+			desc += " [mute]"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s\n", status, desc))
+
+		sb.WriteString(fmt.Sprintf("ID: %s\n", j.ID))
+
+		human := CronExprToHuman(j.CronExpr, lang)
+		sb.WriteString(e.i18n.Tf(MsgCronScheduleLabel, human, j.CronExpr))
+
+		nextRun := e.cronScheduler.NextRun(j.ID)
+		if !nextRun.IsZero() {
+			fmtStr := cronTimeFormat(nextRun, now)
+			sb.WriteString(e.i18n.Tf(MsgCronNextRunLabel, nextRun.Format(fmtStr)))
+		}
+
+		if !j.LastRun.IsZero() {
+			fmtStr := cronTimeFormat(j.LastRun, now)
+			sb.WriteString(e.i18n.Tf(MsgCronLastRunLabel, j.LastRun.Format(fmtStr)))
+			if j.LastError != "" {
+				sb.WriteString(fmt.Sprintf(" (failed: %s)", truncateStr(j.LastError, 40)))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("\n%s", e.i18n.T(MsgCronListFooter)))
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// /cron add <min> <hour> <day> <month> <weekday> <prompt...>
+// /cron add 0 6 * * * 收集 GitHub Trending 数据整理成简报发给我
+func (e *Engine) cmdCronAdd(p Platform, msg *Message, args []string) {
+	// /cron add <min> <hour> <day> <month> <weekday> <prompt...>
+	if len(args) < 6 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronAddUsage))
+		return
+	}
+
+	cronExpr := strings.Join(args[:5], " ")
+	prompt := strings.Join(args[5:], " ")
+
+	job := &CronJob{
+		ID:         GenerateCronID(),
+		Project:    e.name,
+		SessionKey: msg.SessionKey,
+		CronExpr:   cronExpr,
+		Prompt:     prompt,
+		Enabled:    true,
+		CreatedAt:  time.Now(),
+	}
+
+	if err := e.cronScheduler.AddJob(job); err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronAdded), job.ID, cronExpr, truncateStr(prompt, 60)))
+}
+
+// 执行shell命令
+// /cron addexec 0 6 * * * df -h
+func (e *Engine) cmdCronAddExec(p Platform, msg *Message, args []string) {
+	if !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/cron addexec"))
+		return
+	}
+
+	// /cron addexec <min> <hour> <day> <month> <weekday> <shell command...>
+	if len(args) < 6 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronAddExecUsage))
+		return
+	}
+
+	cronExpr := strings.Join(args[:5], " ")
+	shellCmd := strings.Join(args[5:], " ")
+
+	job := &CronJob{
+		ID:         GenerateCronID(),
+		Project:    e.name,
+		SessionKey: msg.SessionKey,
+		CronExpr:   cronExpr,
+		Exec:       shellCmd,
+		Enabled:    true,
+		CreatedAt:  time.Now(),
+	}
+
+	if err := e.cronScheduler.AddJob(job); err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronAddedExec), job.ID, cronExpr, truncateStr(shellCmd, 60)))
+}
+
+// /cron del <id>
+func (e *Engine) cmdCronDel(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronDelUsage))
+		return
+	}
+	id := args[0]
+	if e.cronScheduler.RemoveJob(id) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronDeleted), id))
+	} else {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronNotFound), id))
+	}
+}
+
+// /cron enable|disable <id>
+func (e *Engine) cmdCronToggle(p Platform, msg *Message, args []string, enable bool) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronDelUsage))
+		return
+	}
+	id := args[0]
+	var err error
+	if enable {
+		err = e.cronScheduler.EnableJob(id)
+	} else {
+		err = e.cronScheduler.DisableJob(id)
+	}
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return
+	}
+	if enable {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronEnabled), id))
+	} else {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronDisabled), id))
+	}
+}
+
+// /cron mute|unmute <id>
+func (e *Engine) cmdCronMute(p Platform, msg *Message, args []string, mute bool) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronDelUsage))
+		return
+	}
+	id := args[0]
+	if !e.cronScheduler.Store().SetMute(id, mute) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronNotFound), id))
+		return
+	}
+	if mute {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronMuted), id))
+	} else {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronUnmuted), id))
+	}
+}
+
+// /cron setup
+func (e *Engine) cmdCronSetup(p Platform, msg *Message) {
+	result, baseName, err := e.setupMemoryFile()
+	// 根据返回枚举状态reply
+	switch result {
+	case setupNoMemory:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRelaySetupNoMemory))
+	case setupExists:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupExists), baseName))
+	case setupError:
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+	case setupOK:
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronSetupOK), baseName))
+	}
+}
+
+func (e *Engine) cmdHeartbeat(p Platform, msg *Message, args []string) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatNotAvailable))
+	return
+}
+
+func (e *Engine) cmdCompress(p Platform, msg *Message) {
+	compressor, ok := e.agent.(ContextCompressor)
+	if !ok || compressor.CompressCommand() == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCompressNotSupported))
+		return
+	}
+
+	e.interactiveMu.Lock()
+	state, hasState := e.interactiveStates[msg.SessionKey]
+	e.interactiveMu.Unlock()
+
+	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCompressNoSession))
+		return
+	}
+
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
+	if !session.TryLock() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+		return
+	}
+
+	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
+
+	go e.runCompress(state, session, e.sessions, msg.SessionKey, p, msg.ReplyCtx, false)
+}
+
+// 停止session
+func (e *Engine) cmdStop(p Platform, msg *Message) {
+	if !e.stopInteractiveSession(msg.SessionKey, p, msg.ReplyCtx) {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
+}
+
+func (e *Engine) cmdHelp(p Platform, msg *Message) {
+	if !supportsCards(p) {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHelp))
+		return
+	}
+	e.replyWithCard(p, msg.ReplyCtx, e.renderHelpCard())
+}
+
+func (e *Engine) cmdCommands(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		if !supportsCards(p) {
+			e.cmdCommandsList(p, msg)
+			return
+		}
+		e.replyWithCard(p, msg.ReplyCtx, e.renderCommandsCard())
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{
+		"list", "add", "addexec", "del", "delete", "rm", "remove",
+	})
+	switch sub {
+	case "list":
+		e.cmdCommandsList(p, msg)
+	case "add":
+		e.cmdCommandsAdd(p, msg, args[1:])
+	case "addexec":
+		e.cmdCommandsAddExec(p, msg, args[1:])
+	case "del", "delete", "rm", "remove":
+		e.cmdCommandsDel(p, msg, args[1:])
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsUsage))
+	}
+}
+
+func (e *Engine) cmdCommandsList(p Platform, msg *Message) {
+	cmds := e.commands.ListAll()
+	if len(cmds) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsEmpty))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(e.i18n.Tf(MsgCommandsTitle, len(cmds)))
+
+	for _, c := range cmds {
+		// Tag
+		tag := ""
+		if c.Source == "agent" {
+			tag = " [agent]"
+		} else if c.Exec != "" {
+			tag = " [shell]"
+		}
+		sb.WriteString(fmt.Sprintf("/%s%s\n", c.Name, tag))
+
+		// Description or fallback
+		desc := c.Description
+		if desc == "" {
+			if c.Exec != "" {
+				desc = "$ " + truncateStr(c.Exec, 60)
+			} else {
+				desc = truncateStr(c.Prompt, 60)
+			}
+		}
+		sb.WriteString(fmt.Sprintf("  %s\n\n", desc))
+	}
+
+	sb.WriteString(e.i18n.T(MsgCommandsHint))
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// /commands add finduser 在数据库中查找用户「{{1}}」
+// [[commands]]
+//
+//	name = "finduser"
+//	description = ""
+//	prompt = "在数据库中查找用户「{{1}}」"
+//	exec = ""
+//	work_dir = ""
+func (e *Engine) cmdCommandsAdd(p Platform, msg *Message, args []string) {
+	// /commands add <name> <prompt...>
+	if len(args) < 2 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsAddUsage))
+		return
+	}
+
+	name := strings.ToLower(args[0])
+	prompt := strings.Join(args[1:], " ")
+
+	if _, exists := e.commands.Resolve(name); exists {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandsAddExists), name, name))
+		return
+	}
+
+	e.commands.Add(name, "", prompt, "", "", "config")
+
+	if e.commandSaveAddFunc != nil {
+		if err := e.commandSaveAddFunc(name, "", prompt, "", ""); err != nil {
+			slog.Error("failed to persist command", "error", err)
+		}
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandsAdded), name, truncateStr(prompt, 80)))
+}
+
+// /commands addexec status git status {{args}}
+func (e *Engine) cmdCommandsAddExec(p Platform, msg *Message, args []string) {
+	if !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/commands addexec"))
+		return
+	}
+	// /commands addexec <name> <shell command...>
+	// /commands addexec --work-dir <dir> <name> <shell command...>
+	if len(args) < 2 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsAddExecUsage))
+		return
+	}
+
+	// Parse --work-dir flag
+	workDir := ""
+	i := 0
+	if args[0] == "--work-dir" && len(args) >= 3 {
+		workDir = args[1]
+		i = 2
+	}
+
+	if i >= len(args) {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsAddExecUsage))
+		return
+	}
+
+	name := strings.ToLower(args[i])
+	execCmd := ""
+	if i+1 < len(args) {
+		execCmd = strings.Join(args[i+1:], " ")
+	}
+
+	if execCmd == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsAddExecUsage))
+		return
+	}
+
+	if _, exists := e.commands.Resolve(name); exists {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandsAddExists), name, name))
+		return
+	}
+
+	e.commands.Add(name, "", "", execCmd, workDir, "config")
+
+	if e.commandSaveAddFunc != nil {
+		if err := e.commandSaveAddFunc(name, "", "", execCmd, workDir); err != nil {
+			slog.Error("failed to persist command", "error", err)
+		}
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandsExecAdded), name, truncateStr(execCmd, 80)))
+}
+
+func (e *Engine) cmdCommandsDel(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCommandsDelUsage))
+		return
+	}
+	name := strings.ToLower(args[0])
+
+	if !e.commands.Remove(name) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandsNotFound), name))
+		return
+	}
+
+	if e.commandSaveDelFunc != nil {
+		if err := e.commandSaveDelFunc(name); err != nil {
+			slog.Error("failed to persist command removal", "error", err)
+		}
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandsDeleted), name))
+}
+
+func (e *Engine) cmdSkills(p Platform, msg *Message) {
+	e.replyWithCard(p, msg.ReplyCtx, e.renderSkillsCard())
+}
+
+func (e *Engine) cmdConfig(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		if !supportsCards(p) {
+			items := e.configItems()
+			isZh := e.i18n.IsZhLike()
+			var sb strings.Builder
+			sb.WriteString(e.i18n.T(MsgConfigTitle))
+			for _, item := range items {
+				sb.WriteString(fmt.Sprintf("`%s` = `%s`\n  %s\n\n", item.key, item.getFunc(), item.description(isZh)))
+			}
+			sb.WriteString(e.i18n.T(MsgConfigHint))
+			e.reply(p, msg.ReplyCtx, sb.String())
+			return
+		}
+
+		e.replyWithCard(p, msg.ReplyCtx, e.renderConfigCard())
+		return
+	}
+
+	items := e.configItems()
+	isZh := e.i18n.IsZhLike()
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"get", "set", "reload"})
+
+	switch sub {
+	case "reload":
+		e.cmdConfigReload(p, msg)
+		return
+	case "get":
+		if len(args) < 2 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgConfigGetUsage))
+			return
+		}
+		key := strings.ToLower(args[1])
+		for _, item := range items {
+			if item.key == key {
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf("`%s` = `%s`\n  %s", key, item.getFunc(), item.description(isZh)))
+				return
+			}
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigKeyNotFound, key))
+
+	case "set":
+		if len(args) < 3 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgConfigSetUsage))
+			return
+		}
+		key := strings.ToLower(args[1])
+		value := args[2]
+		for _, item := range items {
+			if item.key == key {
+				if err := item.setFunc(value); err != nil {
+					e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+					return
+				}
+				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigUpdated, key, item.getFunc()))
+				return
+			}
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigKeyNotFound, key))
+
+	default:
+		key := strings.ToLower(sub)
+		for _, item := range items {
+			if item.key == key {
+				if len(args) >= 2 {
+					if err := item.setFunc(args[1]); err != nil {
+						e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+						return
+					}
+					e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigUpdated, key, item.getFunc()))
+				} else {
+					e.reply(p, msg.ReplyCtx, fmt.Sprintf("`%s` = `%s`\n  %s", key, item.getFunc(), item.description(isZh)))
+				}
+				return
+			}
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigKeyNotFound, key))
+	}
+}
+
+func (e *Engine) cmdConfigReload(p Platform, msg *Message) {
+	if e.configReloadFunc == nil {
+		e.reply(p, msg.ReplyCtx, "❌ Config reload not available")
+		return
+	}
+	result, err := e.configReloadFunc()
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgConfigReloaded),
+		result.DisplayUpdated, result.ProvidersUpdated, result.CommandsUpdated))
+}
+
+func (e *Engine) cmdDoctor(p Platform, msg *Message) {
+	results := RunDoctorChecks(e.ctx, e.agent, e.platform)
+	report := FormatDoctorResults(results, e.i18n)
+	e.reply(p, msg.ReplyCtx, report)
+}
+
+func (e *Engine) cmdUpgrade(p Platform, msg *Message, args []string) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgUpgradeDevBuild))
+}
+
+func (e *Engine) cmdRestart(p Platform, msg *Message) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRestarting))
+	select {
+	case RestartCh <- RestartRequest{
+		SessionKey: msg.SessionKey,
+		Platform:   p.Name(),
+	}:
+	default:
+	}
+}
+
+func (e *Engine) cmdAlias(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		if !supportsCards(p) {
+			e.cmdAliasList(p, msg)
+			return
+		}
+		e.replyWithCard(p, msg.ReplyCtx, e.renderAliasCard())
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"list", "add", "del", "delete", "remove"})
+	switch sub {
+	case "list":
+		e.cmdAliasList(p, msg)
+	case "add":
+		e.cmdAliasAdd(p, msg, args[1:])
+	case "del", "delete", "remove":
+		e.cmdAliasDel(p, msg, args[1:])
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAliasUsage))
+	}
+}
+
+func (e *Engine) cmdAliasList(p Platform, msg *Message) {
+	e.aliasMu.RLock()
+	defer e.aliasMu.RUnlock()
+
+	if len(e.aliases) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAliasEmpty))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(e.i18n.T(MsgAliasListHeader), len(e.aliases)))
+	sb.WriteString("\n")
+
+	names := make([]string, 0, len(e.aliases))
+	for n := range e.aliases {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	for _, n := range names {
+		sb.WriteString(fmt.Sprintf("  %s → %s\n", n, e.aliases[n]))
+	}
+	e.reply(p, msg.ReplyCtx, strings.TrimRight(sb.String(), "\n"))
+}
+
+func (e *Engine) cmdAliasAdd(p Platform, msg *Message, args []string) {
+	if len(args) < 2 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAliasUsage))
+		return
+	}
+	name := args[0]
+	command := strings.Join(args[1:], " ")
+	if !strings.HasPrefix(command, "/") {
+		command = "/" + command
+	}
+
+	e.aliasMu.Lock()
+	e.aliases[name] = command
+	e.aliasMu.Unlock()
+
+	if e.aliasSaveAddFunc != nil {
+		if err := e.aliasSaveAddFunc(name, command); err != nil {
+			slog.Error("alias: save failed", "error", err)
+		}
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAliasAdded), name, command))
+}
+
+func (e *Engine) cmdAliasDel(p Platform, msg *Message, args []string) {
+	if len(args) < 1 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAliasUsage))
+		return
+	}
+	name := args[0]
+
+	e.aliasMu.Lock()
+	_, exists := e.aliases[name]
+	if exists {
+		delete(e.aliases, name)
+	}
+	e.aliasMu.Unlock()
+
+	if !exists {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAliasNotFound), name))
+		return
+	}
+
+	if e.aliasSaveDelFunc != nil {
+		if err := e.aliasSaveDelFunc(name); err != nil {
+			slog.Error("alias: save failed", "error", err)
+		}
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAliasDeleted), name))
+}
+
+func (e *Engine) cmdDelete(p Platform, msg *Message, args []string) {
+	agent, sessions := e.agent, e.sessions
+	deleter, ok := agent.(SessionDeleter)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteNotSupported))
+		return
+	}
+
+	if len(args) == 0 {
+		if supportsCards(p) {
+			_ = e.getOrCreateDeleteModeState(msg.SessionKey, p, msg.ReplyCtx)
+			e.replyWithCard(p, msg.ReplyCtx, e.renderDeleteModeCard(msg.SessionKey))
+			return
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteUsage))
+		return
+	}
+	if len(args) > 1 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteUsage))
+		return
+	}
+
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return
+	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
+
+	prefix := strings.TrimSpace(args[0])
+	if isExplicitDeleteBatchArg(prefix) {
+		indices, err := parseDeleteBatchIndices(prefix, len(agentSessions))
+		if err != nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteUsage))
+			return
+		}
+		e.cmdDeleteBatch(p, msg, deleter, agentSessions, indices)
+		return
+	}
+	var matched *AgentSessionInfo
+
+	if idx, err := strconv.Atoi(prefix); err == nil && idx >= 1 && idx <= len(agentSessions) {
+		matched = &agentSessions[idx-1]
+	} else {
+		for i := range agentSessions {
+			if strings.HasPrefix(agentSessions[i].ID, prefix) {
+				matched = &agentSessions[i]
+				break
+			}
+		}
+	}
+
+	if matched == nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), prefix))
+		return
+	}
+
+	e.deleteSingleSession(p, msg, deleter, matched)
+}
+
+func (e *Engine) cmdDeleteBatch(p Platform, msg *Message, deleter SessionDeleter, sessions []AgentSessionInfo, indices []int) {
+	lines := make([]string, 0, len(indices))
+	for _, idx := range indices {
+		matched := &sessions[idx-1]
+		if line := e.deleteSingleSessionReply(msg, deleter, matched); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteUsage))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, strings.Join(lines, "\n"))
+}
+
+// 根据关键词搜索会话
+func (e *Engine) cmdSearch(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSearchUsage))
+		return
+	}
+
+	keyword := strings.ToLower(strings.Join(args, " "))
+
+	// Get all agent sessions
+	agent, sessions := e.agent, e.sessions
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSearchError), err))
+		return
+	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
+
+	type searchResult struct {
+		id           string
+		name         string
+		summary      string
+		matchType    string // "name" or "message"
+		messageCount int
+	}
+
+	var results []searchResult
+
+	for _, s := range agentSessions {
+		// Check session name (custom name or summary)
+		customName := sessions.GetSessionName(s.ID)
+		displayName := customName
+		if displayName == "" {
+			displayName = s.Summary
+		}
+
+		// Match by name/summary
+		if strings.Contains(strings.ToLower(displayName), keyword) {
+			results = append(results, searchResult{
+				id:           s.ID,
+				name:         displayName,
+				summary:      s.Summary,
+				matchType:    "name",
+				messageCount: s.MessageCount,
+			})
+			continue
+		}
+
+		// Match by session ID prefix
+		if strings.HasPrefix(strings.ToLower(s.ID), keyword) {
+			results = append(results, searchResult{
+				id:           s.ID,
+				name:         displayName,
+				summary:      s.Summary,
+				matchType:    "id",
+				messageCount: s.MessageCount,
+			})
+			continue
+		}
+	}
+
+	if len(results) == 0 {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSearchNoResult), keyword))
+		return
+	}
+
+	// Build result message
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(e.i18n.T(MsgSearchResult), len(results), keyword))
+
+	for i, r := range results {
+		shortID := r.id
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		sb.WriteString(fmt.Sprintf("\n%d. [%s] %s", i+1, shortID, r.name))
+	}
+
+	sb.WriteString("\n\n" + e.i18n.T(MsgSearchHint))
+
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
+	// Strip the command prefix ("/shell ", "/sh ", "/exec ", "/run ")
+	shellCmd := raw
+	for _, prefix := range []string{"/shell ", "/sh ", "/exec ", "/run "} {
+		if strings.HasPrefix(strings.ToLower(raw), prefix) {
+			shellCmd = raw[len(prefix):]
+			break
+		}
+	}
+	shellCmd = strings.TrimSpace(shellCmd)
+
+	if shellCmd == "" {
+		e.reply(p, msg.ReplyCtx, "Usage: /shell <command>\nExample: /shell ls -la")
+		return
+	}
+
+	workDir := e.commandWorkDir(e.agent, msg)
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd)
+		cmd.Dir = workDir
+		output, err := cmd.CombinedOutput()
+
+		if ctx.Err() == context.DeadlineExceeded {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandTimeout), shellCmd))
+			return
+		}
+
+		result := strings.TrimSpace(string(output))
+		if err != nil && result == "" {
+			result = err.Error()
+		}
+		if result == "" {
+			result = "(no output)"
+		}
+		if runes := []rune(result); len(runes) > 4000 {
+			result = string(runes[:3997]) + "..."
+		}
+
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("$ %s\n```\n%s\n```", shellCmd, result))
+	}()
+}
+
+// 在workdir 中执行 git diff操作
+// Parse optional target: /diff [target]
+func (e *Engine) cmdDiff(p Platform, msg *Message, raw string) {
+	// Parse optional target: /diff [target]
+	diffTarget := ""
+	if strings.HasPrefix(strings.ToLower(raw), "/diff ") {
+		diffTarget = strings.TrimSpace(raw[6:])
+	}
+
+	if strings.HasPrefix(diffTarget, "-") {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), "diff target must not start with '-'"))
+		return
+	}
+
+	// Resolve working directory (same pattern as cmdShell)
+	var workDir string
+
+	if workDir == "" {
+		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+			workDir = wd.GetWorkDir()
+		}
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
+		defer cancel()
+
+		// Get current branch name and short commit ID
+		branchCmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "HEAD")
+		branchCmd.Dir = workDir
+		branchOut, _ := branchCmd.Output()
+		currentBranch := strings.TrimSpace(string(branchOut))
+		if currentBranch == "" {
+			currentBranch = "unknown"
+		}
+
+		commitCmd := exec.CommandContext(ctx, "git", "rev-parse", "--short", "HEAD")
+		commitCmd.Dir = workDir
+		commitOut, _ := commitCmd.Output()
+		commitID := strings.TrimSpace(string(commitOut))
+		if commitID == "" {
+			commitID = "0000000"
+		}
+
+		gitArgs := []string{"diff"}
+		if diffTarget != "" {
+			gitArgs = append(gitArgs, "--", diffTarget)
+		}
+		gitCmd := exec.CommandContext(ctx, "git", gitArgs...)
+		gitCmd.Dir = workDir
+		diffOutput, err := gitCmd.Output()
+
+		if ctx.Err() == context.DeadlineExceeded {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandTimeout), "git diff"))
+			return
+		}
+		if err != nil && len(diffOutput) == 0 {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			return
+		}
+
+		target := diffTarget
+		if target == "" {
+			target = "HEAD"
+		}
+		if len(strings.TrimSpace(string(diffOutput))) == 0 {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgDiffEmpty), target))
+			return
+		}
+
+		// Try diff2html + FileSender
+		if fileSender, ok := p.(FileSender); ok {
+			title := fmt.Sprintf("%s vs %s", currentBranch, target)
+			htmlData, err := e.diff2html(ctx, diffOutput, workDir, title)
+			if err == nil {
+				fileName := fmt.Sprintf("%s-%s.html", currentBranch, commitID)
+				_ = e.waitOutgoing(p)
+				if err := fileSender.SendFile(e.ctx, msg.ReplyCtx, FileAttachment{
+					MimeType: "text/html", Data: htmlData, FileName: fileName,
+				}); err == nil {
+					return
+				}
+			}
+			if errors.Is(err, exec.ErrNotFound) {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDiffNoDiff2HTML))
+			}
+		}
+
+		// Fallback: plain text diff
+		result := strings.TrimSpace(string(diffOutput))
+		if runes := []rune(result); len(runes) > 4000 {
+			result = string(runes[:3997]) + "..."
+		}
+		e.reply(p, msg.ReplyCtx, "```diff\n"+result+"\n```")
+	}()
+}
+
+// 展示传入文件内容
+func (e *Engine) cmdShow(p Platform, msg *Message, args []string) {
+	rawRef := strings.TrimSpace(strings.Join(args, " "))
+	if rawRef == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgShowUsage))
+		return
+	}
+
+	workDir := e.commandWorkDir(e.agent, msg)
+	req, err := buildReferenceViewRequest(rawRef, workDir)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowParseError, rawRef))
+		return
+	}
+	content, err := renderReferenceView(req)
+	if err != nil {
+		switch {
+		case strings.Contains(err.Error(), "path does not exist"):
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowNotFound, rawRef))
+		case strings.Contains(err.Error(), "directory reference cannot carry a location"):
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowDirWithLocation, rawRef))
+		default:
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowReadFailed, err))
+		}
+		return
+	}
+	e.reply(p, msg.ReplyCtx, content)
+}
+
+func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
+	currentDir := e.baseWorkDir
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirCurrent, currentDir))
+}
+
+func (e *Engine) cmdWhoami(p Platform, msg *Message) {
+	if supportsCards(p) {
+		e.replyWithCard(p, msg.ReplyCtx, e.renderWhoamiCard(msg))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, e.formatWhoamiText(msg))
+}
+
+func (e *Engine) formatWhoamiText(msg *Message) string {
+	var sb strings.Builder
+	sb.WriteString(e.i18n.T(MsgWhoamiTitle))
+	sb.WriteString("\n")
+
+	if msg.UserID != "" {
+		sb.WriteString(fmt.Sprintf("User ID: `%s`\n", msg.UserID))
+	} else {
+		sb.WriteString("User ID: (unknown)\n")
+	}
+	if msg.UserName != "" {
+		sb.WriteString(fmt.Sprintf("Name: %s\n", msg.UserName))
+	}
+	if msg.Platform != "" {
+		sb.WriteString(fmt.Sprintf("Platform: %s\n", msg.Platform))
+	}
+
+	chatID := extractChannelID(msg.SessionKey)
+	if chatID != "" {
+		sb.WriteString(fmt.Sprintf("Chat ID: `%s`\n", chatID))
+	}
+	sb.WriteString(fmt.Sprintf("Session Key: `%s`\n", msg.SessionKey))
+
+	sb.WriteString("\n")
+	sb.WriteString(e.i18n.T(MsgWhoamiUsage))
+	return sb.String()
+}
+
+func (e *Engine) cmdWeb(p Platform, msg *Message, args []string) {
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgWebNotSupported))
 }
 
 // ======================== 辅助函数 ========================
@@ -3750,4 +6099,186 @@ func isDenyResponse(s string) bool {
 		}
 	}
 	return false
+}
+
+// 给定前缀找到唯一匹配的命令,返回command id 或者 没有匹配 / ambiguous 返回"".
+func matchPrefix(prefix string, candidates []struct {
+	names []string
+	id    string
+}) string {
+	// Exact match first
+	for _, c := range candidates {
+		for _, n := range c.names {
+			if prefix == n {
+				return c.id
+			}
+		}
+	}
+	// Prefix match
+	var matched string
+	for _, c := range candidates {
+		for _, n := range c.names {
+			if strings.HasPrefix(n, prefix) {
+				if matched != "" && matched != c.id {
+					return "" // ambiguous
+				}
+				matched = c.id
+				break
+			}
+		}
+	}
+	return matched
+}
+
+func supportsCards(p Platform) bool {
+	_, ok := p.(CardSender)
+	return ok
+}
+
+func parseModelSwitchArgs(args []string) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	if len(args) == 1 {
+		if strings.EqualFold(strings.TrimSpace(args[0]), "switch") {
+			return "", false
+		}
+		return args[0], true
+	}
+	if strings.EqualFold(strings.TrimSpace(args[0]), "switch") && len(args) >= 2 {
+		return strings.TrimSpace(args[1]), true
+	}
+	return "", false
+}
+
+func modelSwitchNeedsLookup(input string) bool {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return false
+	}
+	if _, err := strconv.Atoi(input); err == nil {
+		return true
+	}
+	return !strings.Contains(input, "/")
+}
+
+// 解析用户提供的model 名称string, 先检查外部的别名匹配, 然后fall back 到原始的值
+// (可能)
+func resolveModelAlias(models []ModelOption, input string) string {
+	for _, m := range models {
+		if m.Alias != "" && strings.EqualFold(m.Alias, input) {
+			return m.Name
+		}
+	}
+	return input
+}
+
+func resolveModelSwitchTarget(input string, models []ModelOption) string {
+	input = strings.TrimSpace(input)
+	if idx, err := strconv.Atoi(input); err == nil && idx >= 1 && idx <= len(models) {
+		return models[idx-1].Name
+	}
+	if resolved := resolveModelAlias(models, input); resolved != input {
+		return resolved
+	}
+	for _, m := range models {
+		if strings.EqualFold(m.Name, input) {
+			return m.Name
+		}
+	}
+	return input
+}
+
+// 与一系列子名称做前缀匹配
+func matchSubCommand(input string, candidates []string) string {
+	for _, c := range candidates {
+		if input == c {
+			return c
+		}
+	}
+	var matched string
+	for _, c := range candidates {
+		if strings.HasPrefix(c, input) {
+			if matched != "" {
+				return input // ambiguous → return raw input (will hit default)
+			}
+			matched = c
+		}
+	}
+	if matched != "" {
+		return matched
+	}
+	return input
+}
+
+func isExplicitDeleteBatchArg(arg string) bool {
+	if strings.Contains(arg, ",") {
+		return true
+	}
+	if !strings.Contains(arg, "-") {
+		return false
+	}
+	for _, r := range arg {
+		if (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseDeleteBatchIndices(spec string, max int) ([]int, error) {
+	parts := strings.Split(spec, ",")
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty batch spec")
+	}
+	seen := make(map[int]struct{}, len(parts))
+	indices := make([]int, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("empty batch item")
+		}
+
+		if strings.Contains(part, "-") {
+			bounds := strings.Split(part, "-")
+			if len(bounds) != 2 || bounds[0] == "" || bounds[1] == "" {
+				return nil, fmt.Errorf("invalid range %q", part)
+			}
+			start, err := strconv.Atoi(bounds[0])
+			if err != nil {
+				return nil, err
+			}
+			end, err := strconv.Atoi(bounds[1])
+			if err != nil {
+				return nil, err
+			}
+			if start < 1 || end < 1 || start > end || end > max {
+				return nil, fmt.Errorf("range %q out of bounds", part)
+			}
+			for idx := start; idx <= end; idx++ {
+				if _, ok := seen[idx]; ok {
+					continue
+				}
+				seen[idx] = struct{}{}
+				indices = append(indices, idx)
+			}
+			continue
+		}
+
+		idx, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, err
+		}
+		if idx < 1 || idx > max {
+			return nil, fmt.Errorf("index %d out of bounds", idx)
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		indices = append(indices, idx)
+	}
+
+	return indices, nil
 }

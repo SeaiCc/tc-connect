@@ -76,7 +76,8 @@ func (a *Agent) SetSessionEnv(env []string) {
 
 func (a *Agent) Stop() error { return nil }
 
-func (a *Agent) CompressCommand() string { return "/compact" }
+// 2026.5.25 Opencode不支持 /compact
+// func (a *Agent) CompressCommand() string { return "/compact" }
 
 // ========================== 公共方法:: Mode切换 ==========================
 
@@ -100,6 +101,8 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 	}
 }
 
+// ========================== 公共方法:: Model切换 ==========================
+
 // ========================== 公共方法:: Session 相关 ==========================
 
 // 创建或回复一个交互session
@@ -117,6 +120,24 @@ type opencodeSessionEntry struct {
 	Title   string `json:"title"`
 	Updated int64  `json:"updated"` // Unix timestamp in milliseconds
 	Created int64  `json:"created"`
+}
+
+
+// ========================== 公共方法:: MemoryFileProvider 相关 ==========================
+func (a *Agent) ProjectMemoryFile() string {
+	absDir, err := filepath.Abs(a.workDir)
+	if err != nil {
+		absDir = a.workDir
+	}
+	return filepath.Join(absDir, "OPENCODE.md")
+}
+
+func (a *Agent) GlobalMemoryFile() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".opencode", "OPENCODE.md")
 }
 
 // ========================== 辅助方法 ==========================

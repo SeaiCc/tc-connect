@@ -19,6 +19,7 @@ type RateLimiter struct {
 	buckets map[string]*rateBucket
 	maxMessages int
 	windowMs    int64
+	stopCh      chan struct{}
 }
 
 func (rl *RateLimiter) Allow(key string) bool {
@@ -51,6 +52,16 @@ func (rl *RateLimiter) Allow(key string) bool {
 	}
 	b.timestamps = append(b.timestamps, now)
 	return true
+}
+
+// Stop 终止后台清理的 goroutine。即使多次调用或在限流器已禁用（maxMessages=0）的情况下调用，也是安全的。
+func (rl *RateLimiter) Stop() {
+	select {
+	case <-rl.stopCh:
+		// already stopped
+	default:
+		close(rl.stopCh)
+	}
 }
 
 

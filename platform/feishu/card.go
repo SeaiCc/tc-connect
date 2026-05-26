@@ -2,12 +2,52 @@ package feishu
 
 import (
 	"strings"
+	"context"
+	"fmt"
+	"log/slog"
+	"encoding/json"
 
 	"tc-connect/core"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
 func plainText(content string) map[string]any {
 	return map[string]any{"tag": "plain_text", "content": content}
+}
+
+// 发送一个结构化的卡片作为原始消息的响应
+func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *core.Card) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+
+	cardJSON := renderCard(card, rc.sessionKey)
+	if !p.shouldUseThreadOrReplyAPI(rc) {
+		if rc.chatID == "" {
+			return fmt.Errorf("%s: chatID is empty, cannot send card", p.tag())
+		}
+		return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
+	}
+	return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+}
+
+// 发哦是那个一个结构化的卡片作为chat的新消息
+func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core.Card) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	if rc.chatID == "" {
+		return fmt.Errorf("%s: chatID is empty, cannot send card", p.tag())
+	}
+
+	if !p.noReplyToTrigger && p.shouldReplyInThread(rc) {
+		return p.ReplyCard(ctx, rctx, card)
+	}
+
+	cardJSON := renderCard(card, rc.sessionKey)
+	return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
 }
 
 type deleteModeCheckerRow struct {
@@ -379,4 +419,14 @@ func normalizeDeleteModeCheckerText(text string) string {
 		}
 	}
 	return trimmed
+}
+
+// 将core.Card转换未Feishu 交互卡片JSON string
+func renderCard(card *core.Card, sessionKey string) string {
+	b, err := json.Marshal(renderCardMap(card, sessionKey))
+	if err != nil {
+		slog.Error("feishu: renderCard marshal failed", "error", err)
+		return `{"config":{"wide_screen_mode":true},"elements":[]}`
+	}
+	return string(b)
 }

@@ -1,13 +1,17 @@
 package core
 
 import (
+	"encoding/hex"
+	"os"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"path/filepath"
 	"sync"
 	"time"
+	"crypto/rand"
 
 	"github.com/robfig/cron/v3"
 )
@@ -34,9 +38,10 @@ type CronJob struct {
 	Silent      *bool  `json:"silent,omitempty"`       // 抑制启动通知; nil = 使用全局默认
 	Mute        bool   `json:"mute,omitempty"`         // 抑制所有消息(启动+结果) 作业静默运行
 	SessionMode string `json:"session_mode,omitempty"` // "" or "reuse" = 共享active
-	Mode        string `json:"mode,omitempty"` // "" 或 "reuse" = share active
+	Mode        string `json:"mode,omitempty"`         // "" 或 "reuse" = share active
 
 	TimeoutMins *int      `json:"timeout_mins,omitempty"` // nil = 默认 30m wait; 0 = 无限制; >0 = minutes
+	CreatedAt   time.Time `json:"created_at"`
 	LastRun     time.Time `json:"last_run,omitempty"`
 	LastError   string    `json:"last_error,omitempty"`
 }
@@ -66,6 +71,27 @@ type CronStore struct {
 	path string
 	mu   sync.Mutex
 	jobs []*CronJob
+}
+
+func NewCronStore(dataDir string) (*CronStore, error) {
+	dir := filepath.Join(dataDir, "crons")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, "jobs.json")
+	s := &CronStore{path: path}
+	s.load()
+	return s, nil
+}
+
+func (s *CronStore) load() {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return
+	}
+	if err := json.Unmarshal(data, &s.jobs); err != nil {
+		slog.Error("cron: failed to load jobs", "path", s.path, "error", err)
+	}
 }
 
 func (s *CronStore) MarkRun(id string, err error) {
@@ -178,6 +204,15 @@ type CronScheduler struct {
 	defaultSessionMode string                  // 全局默认session mode; "" = reuse, "new_per_run" = 刷新每个session
 }
 
+func NewCronScheduler(store *CronStore) *CronScheduler {
+	return &CronScheduler{
+		store:   store,
+		cron:    cron.New(),
+		engine:  nil,
+		entries: make(map[string]cron.EntryID),
+	}
+}
+
 func (cs *CronScheduler) Store() *CronStore {
 	return cs.store
 }
@@ -190,7 +225,41 @@ func (cs *CronScheduler) UsesNewSession(job *CronJob) bool {
 	return cs.defaultSessionMode == "new_per_run"
 }
 
+func (cs *CronScheduler) SetDefaultSilent(silent bool) {
+	cs.defaultSilent = silent
+}
+
+func (cs *CronScheduler) RegisterEngine(name string, e *Engine) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.engine = e
+}
+
 // ======================== CronScheduler:: job相关 =============================
+
+func (s *CronStore) Add(job *CronJob) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.jobs = append(s.jobs, job)
+	return s.save()
+}
+
+func (cs *CronScheduler) AddJob(job *CronJob) error {
+	if err := validateCronJob(job); err != nil {
+		return err
+	}
+	job.SessionMode = NormalizeCronSessionMode(job.SessionMode)
+	if _, err := cron.ParseStandard(job.CronExpr); err != nil {
+		return fmt.Errorf("invalid cron expression %q: %w", job.CronExpr, err)
+	}
+	if err := cs.store.Add(job); err != nil {
+		return err
+	}
+	if job.Enabled {
+		return cs.scheduleJob(job)
+	}
+	return nil
+}
 
 // 从 CronScheduler entries 以及 CronStore中移除
 func (cs *CronScheduler) RemoveJob(id string) bool {
@@ -548,3 +617,32 @@ func NormalizeCronSessionMode(s string) string {
 	}
 }
 
+// 生成唯一定时任务
+func GenerateCronID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Errorf("generate cron id: %w", err))
+	}
+	return hex.EncodeToString(b)
+}
+
+func validateCronJob(j *CronJob) error {
+	// 判断SessionMode 是否为合法 new_per_run
+	mode := NormalizeCronSessionMode(j.SessionMode)
+	if mode != "" && mode != "new_per_run" {
+		return fmt.Errorf("invalid session_mode %q (want reuse, new_per_run, or new-per-run)", j.SessionMode)
+	}
+	// 判断mode 是否为合法 default | bypassPermissions | acceptEdits | plan | auto | dontAsk
+	if j.Mode != "" {
+		switch j.Mode {
+		case "default", "bypassPermissions", "acceptEdits", "plan", "auto", "dontAsk":
+		default:
+			return fmt.Errorf("invalid mode %q (want default, bypassPermissions, acceptEdits, plan, auto, or dontAsk)", j.Mode)
+		}
+	}
+	// 判断超时时间>0
+	if j.TimeoutMins != nil && *j.TimeoutMins < 0 {
+		return fmt.Errorf("timeout_mins must be >= 0")
+	}
+	return nil
+}

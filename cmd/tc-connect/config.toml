@@ -3,11 +3,14 @@ language = "zh"
 
 [project]
   name = "my-project"
+  admin_from = "ou_f8a2305b4150507a56628aced98b783d"
+  allow_from = "ou_f8a2305b4150507a56628aced98b783d"
+
   [project.agent]
     type = "opencode"
     [project.agent.options]
       mode = "default"
-      work_dir = "/media/ubuntu/data/gitSourceCode/AIWorkflow/tc-connect"
+      work_dir = "/media/ubuntu/data/gitSourceCode/AIWorkflow/tc-connect-playground"
 
   [project.platform]
     type = "feishu"

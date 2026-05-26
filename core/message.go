@@ -9,6 +9,27 @@ import (
 	"time"
 )
 
+
+// 返回基础环境变量，并使用额外覆盖的相同键值对中的条目替换原有条目。
+// 这可以防止出现重复的键（例如两个PATH条目），因为在Linux上，
+// 重复的键会导致覆盖操作被默默忽略（getenv返回第一个匹配项）。
+func MergeEnv(base, extra []string) []string {
+	keys := make(map[string]bool, len(extra))
+	for _, e := range extra {
+		if k, _, ok := strings.Cut(e, "="); ok {
+			keys[k] = true
+		}
+	}
+	merged := make([]string, 0, len(base)+len(extra))
+	for _, e := range base {
+		if k, _, ok := strings.Cut(e, "="); ok && keys[k] {
+			continue
+		}
+		merged = append(merged, e)
+	}
+	return append(merged, extra...)
+}
+
 // 表示用户发送的图片
 type ImageAttachment struct {
 	MimeType string // e.g. "image/png", "image/jepg"
