@@ -22,10 +22,10 @@ type Config struct {
 	Quiet    *bool           `toml:"quiet,omitempty"`
 	Commands []CommandConfig `toml:"commands"` // 全局自定义 / 命令
 	Project  ProjectConfig   `toml:"project"`
-	Aliases           []AliasConfig           `toml:"aliases"`      // global command aliases
+	Aliases  []AliasConfig   `toml:"aliases"` // global command aliases
 
-	Log      LogConfig       `toml:"log"`
-	Language string          `toml:"language"`
+	Log      LogConfig `toml:"log"`
+	Language string    `toml:"language"`
 
 	Display DisplayConfig `toml:"display"`
 
@@ -33,7 +33,7 @@ type Config struct {
 	Bridge BridgeConfig `toml:"bridge"`
 }
 
-// 映射trigger string 到command 
+// 映射trigger string 到command
 type AliasConfig struct {
 	Name    string `toml:"name"`    // trigger text (e.g. "帮助")
 	Command string `toml:"command"` // target command (e.g. "/help")
@@ -94,9 +94,33 @@ type AutoCompressConfig struct {
 	MinGapMins *int  `toml:"min_gap_mins,omitempty"` // minimum minutes between auto-compress runs (default 30)
 }
 
+// SubAgentConfig 子 Agent 配置
+type SubAgentConfig struct {
+	TimeoutMins *int   `toml:"timeout_mins,omitempty"` // 超时时间（分钟），覆盖全局配置
+	MaxRetries  *int   `toml:"max_retries,omitempty"`  // 最大重试次数，覆盖全局配置
+	WorkDir     string `toml:"work_dir,omitempty"`     // 工作目录
+	Description string `toml:"description,omitempty"`  // 描述
+}
+
+// HarnessConfig 多 Agent 编排配置
+type HarnessConfig struct {
+	Enabled       *bool                     `toml:"enabled"`                    // 是否启用编排模式
+	SubAgentDir   string                    `toml:"sub_agent_dir,omitempty"`    // 子 Agent 提示词目录
+	TimeoutMins   *int                      `toml:"timeout_mins,omitempty"`     // 超时时间（分钟）
+	MaxRetries    *int                      `toml:"max_retries,omitempty"`      // 最大重试次数
+	MaxConcurrent *int                      `toml:"max_concurrent,omitempty"`   // 最大并发数
+	MaxPerProject *int                      `toml:"max_per_project,omitempty"`  // 每项目最大并发数
+	SessionTTL    *int                      `toml:"session_ttl_mins,omitempty"` // 会话过期时间（分钟）
+	LogLevel      string                    `toml:"log_level,omitempty"`        // 日志级别：debug, info, warn, error
+	LogOutputPath string                    `toml:"log_output_path,omitempty"`  // 日志输出路径
+	Aliases       map[string]string         `toml:"aliases,omitempty"`          // 子 Agent 别名映射
+	Agents        map[string]SubAgentConfig `toml:"agents,omitempty"`           // 子 Agent 独立配置
+}
+
 type AgentConfig struct {
 	Type    string         `toml:"type"`
 	Options map[string]any `toml:"options"`
+	Harness HarnessConfig  `toml:"harness"` // 多 Agent 编排配置
 }
 
 type PlatformConfig struct {
@@ -365,4 +389,121 @@ func projectQuietEffective(cfg *Config, proj *ProjectConfig) bool {
 		return *cfg.Quiet
 	}
 	return false
+}
+
+// ReloadHarnessConfig 重新加载配置并返回新的 HarnessConfig
+// 支持运行时配置重载
+func ReloadHarnessConfig() (*HarnessConfig, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return nil, fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	return &cfg.Project.Agent.Harness, nil
+}
+
+// GetSubAgentConfig 获取指定子 Agent 的有效配置，支持独立配置覆盖全局配置
+// 如果 agentConfig 为空，返回全局默认配置
+func GetSubAgentConfig(harnessCfg *HarnessConfig, agentName string) SubAgentConfig {
+	if harnessCfg == nil {
+		return SubAgentConfig{}
+	}
+
+	// 获取子 Agent 的独立配置
+	agentCfg, exists := harnessCfg.Agents[agentName]
+	if !exists {
+		// 如果没有独立配置，返回空配置（将使用全局默认值）
+		return SubAgentConfig{}
+	}
+
+	return agentCfg
+}
+
+// GetEffectiveTimeoutMins 获取有效超时时间
+// 优先使用子 Agent 独立配置，其次使用全局配置，默认 5 分钟
+func GetEffectiveTimeoutMins(harnessCfg *HarnessConfig, agentName string) int {
+	defaultTimeout := 5
+
+	// 检查子 Agent 独立配置
+	if agentCfg, exists := harnessCfg.Agents[agentName]; exists && agentCfg.TimeoutMins != nil {
+		return *agentCfg.TimeoutMins
+	}
+
+	// 检查全局配置
+	if harnessCfg.TimeoutMins != nil {
+		return *harnessCfg.TimeoutMins
+	}
+
+	// 默认值
+	return defaultTimeout
+}
+
+// GetEffectiveMaxRetries 获取有效最大重试次数
+// 优先使用子 Agent 独立配置，其次使用全局配置，默认 3 次
+func GetEffectiveMaxRetries(harnessCfg *HarnessConfig, agentName string) int {
+	defaultRetries := 3
+
+	// 检查子 Agent 独立配置
+	if agentCfg, exists := harnessCfg.Agents[agentName]; exists && agentCfg.MaxRetries != nil {
+		return *agentCfg.MaxRetries
+	}
+
+	// 检查全局配置
+	if harnessCfg.MaxRetries != nil {
+		return *harnessCfg.MaxRetries
+	}
+
+	// 默认值
+	return defaultRetries
+}
+
+// GetEffectiveMaxConcurrent 获取有效最大并发数，默认 5
+func GetEffectiveMaxConcurrent(harnessCfg *HarnessConfig) int {
+	if harnessCfg == nil || harnessCfg.MaxConcurrent == nil {
+		return 5
+	}
+	return *harnessCfg.MaxConcurrent
+}
+
+// GetEffectiveMaxPerProject 获取有效每项目最大并发数，默认 2
+func GetEffectiveMaxPerProject(harnessCfg *HarnessConfig) int {
+	if harnessCfg == nil || harnessCfg.MaxPerProject == nil {
+		return 2
+	}
+	return *harnessCfg.MaxPerProject
+}
+
+// IsHarnessEnabled 检查 harness 是否启用，默认 false
+func IsHarnessEnabled(harnessCfg *HarnessConfig) bool {
+	if harnessCfg == nil || harnessCfg.Enabled == nil {
+		return false
+	}
+	return *harnessCfg.Enabled
+}
+
+// GetSessionTTL 获取会话过期时间（分钟），默认 30 分钟
+func GetSessionTTL(harnessCfg *HarnessConfig) int {
+	if harnessCfg == nil || harnessCfg.SessionTTL == nil {
+		return 30
+	}
+	return *harnessCfg.SessionTTL
+}
+
+// GetSubAgentAlias 获取子 Agent 别名，如果不存在则返回原名
+func GetSubAgentAlias(harnessCfg *HarnessConfig, alias string) string {
+	if harnessCfg == nil || harnessCfg.Aliases == nil {
+		return alias
+	}
+	if realName, exists := harnessCfg.Aliases[alias]; exists {
+		return realName
+	}
+	return alias
 }

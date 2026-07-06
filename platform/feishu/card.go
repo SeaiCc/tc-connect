@@ -1,13 +1,14 @@
 package feishu
 
 import (
-	"strings"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
-	"encoding/json"
+	"strings"
 
-	"tc-connect/core"
+	"tc-connect/core/types"
+
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -16,7 +17,7 @@ func plainText(content string) map[string]any {
 }
 
 // 发送一个结构化的卡片作为原始消息的响应
-func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *core.Card) error {
+func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *types.Card) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
@@ -33,7 +34,7 @@ func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *cor
 }
 
 // 发哦是那个一个结构化的卡片作为chat的新消息
-func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core.Card) error {
+func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *types.Card) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
@@ -56,10 +57,10 @@ type deleteModeCheckerRow struct {
 	checked bool
 }
 
-// 将core.Card 转换为Feishu Interactive Card map
+// types.Card 转换为Feishu Interactive Card map
 // v1 格式, 同时给 message API (via renderCard) 和
 // 响应回调使用 (CardActionTriggerResponse).
-func renderCardMap(card *core.Card, sessionKey string) map[string]any {
+func renderCardMap(card *types.Card, sessionKey string) map[string]any {
 	result := map[string]any{
 		"config": map[string]any{
 			"wide_screen_mode": true,
@@ -86,16 +87,16 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 	var elements []map[string]any
 	for _, elem := range card.Elements {
 		switch e := elem.(type) {
-		case core.CardMarkdown:
+		case types.CardMarkdown:
 			elements = append(elements, map[string]any{
 				"tag":     "markdown",
 				"content": e.Content,
 			})
-		case core.CardDivider:
+		case types.CardDivider:
 			elements = append(elements, map[string]any{
 				"tag": "hr",
 			})
-		case core.CardActions:
+		case types.CardActions:
 			var actions []map[string]any
 			for _, btn := range e.Buttons {
 				btnType := btn.Type
@@ -115,13 +116,13 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 					"type":  btnType,
 					"value": valMap,
 				}
-				if e.Layout == core.CardActionLayoutEqualColumns {
+				if e.Layout == types.CardActionLayoutEqualColumns {
 					action["width"] = "fill"
 				}
 				actions = append(actions, action)
 			}
 			if len(actions) > 0 {
-				if e.Layout == core.CardActionLayoutEqualColumns {
+				if e.Layout == types.CardActionLayoutEqualColumns {
 					columns := make([]map[string]any, 0, len(actions))
 					for _, action := range actions {
 						columns = append(columns, map[string]any{
@@ -148,7 +149,7 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 					})
 				}
 			}
-		case core.CardListItem:
+		case types.CardListItem:
 			btnType := e.BtnType
 			if btnType == "" {
 				btnType = "default"
@@ -191,7 +192,7 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 					},
 				},
 			})
-		case core.CardSelect:
+		case types.CardSelect:
 			var options []map[string]any
 			for _, opt := range e.Options {
 				options = append(options, map[string]any{
@@ -214,7 +215,7 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 				"tag":     "action",
 				"actions": []map[string]any{selectElem},
 			})
-		case core.CardNote:
+		case types.CardNote:
 			elements = append(elements, map[string]any{
 				"tag":      "note",
 				"elements": []map[string]any{plainText(e.Text)},
@@ -231,20 +232,20 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 }
 
 // 渲染删除选择卡片
-func renderDeleteModeCheckerCard(card *core.Card, base map[string]any) (map[string]any, bool) {
+func renderDeleteModeCheckerCard(card *types.Card, base map[string]any) (map[string]any, bool) {
 	if card == nil {
 		return nil, false
 	}
 
 	formRowElements := make([]map[string]any, 0)
-	notes := make([]core.CardNote, 0)
-	navRows := make([]core.CardActions, 0)
+	notes := make([]types.CardNote, 0)
+	navRows := make([]types.CardActions, 0)
 	submitText := ""
 	cancelText := ""
 
 	for _, elem := range card.Elements {
 		switch e := elem.(type) {
-		case core.CardListItem:
+		case types.CardListItem:
 			id, selectable, ok := parseDeleteModeListItemAction(e.BtnValue)
 			if !ok {
 				return nil, false
@@ -271,10 +272,10 @@ func renderDeleteModeCheckerCard(card *core.Card, base map[string]any) (map[stri
 					"content": row.text,
 				},
 			})
-		case core.CardNote:
+		case types.CardNote:
 			notes = append(notes, e)
-		case core.CardActions:
-			remaining := make([]core.CardButton, 0, len(e.Buttons))
+		case types.CardActions:
+			remaining := make([]types.CardButton, 0, len(e.Buttons))
 			for _, btn := range e.Buttons {
 				switch btn.Value {
 				case "act:/delete-mode confirm":
@@ -286,9 +287,9 @@ func renderDeleteModeCheckerCard(card *core.Card, base map[string]any) (map[stri
 				}
 			}
 			if len(remaining) > 0 {
-				navRows = append(navRows, core.CardActions{Buttons: remaining, Layout: e.Layout})
+				navRows = append(navRows, types.CardActions{Buttons: remaining, Layout: e.Layout})
 			}
-		case core.CardMarkdown, core.CardDivider, core.CardSelect:
+		case types.CardMarkdown, types.CardDivider, types.CardSelect:
 			return nil, false
 		}
 	}
@@ -374,7 +375,7 @@ func renderDeleteModeCheckerCard(card *core.Card, base map[string]any) (map[stri
 				"type":  btnType,
 				"value": valMap,
 			}
-			if row.Layout == core.CardActionLayoutEqualColumns {
+			if row.Layout == types.CardActionLayoutEqualColumns {
 				action["width"] = "fill"
 			}
 			actions = append(actions, action)
@@ -421,8 +422,8 @@ func normalizeDeleteModeCheckerText(text string) string {
 	return trimmed
 }
 
-// 将core.Card转换未Feishu 交互卡片JSON string
-func renderCard(card *core.Card, sessionKey string) string {
+// types.Card转换未Feishu 交互卡片JSON string
+func renderCard(card *types.Card, sessionKey string) string {
 	b, err := json.Marshal(renderCardMap(card, sessionKey))
 	if err != nil {
 		slog.Error("feishu: renderCard marshal failed", "error", err)

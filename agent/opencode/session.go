@@ -11,46 +11,49 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"tc-connect/core"
+	"tc-connect/core/session"
+	"tc-connect/core/types"
 	"time"
 )
 
 // 使用OpencCodeCLI 管理多轮对话, 每次执行Send() 相当于
 // 启动`opencode run --format json`进程， --session参数 用于继续会话
 type opencodeSession struct {
-	cmd     string
-	workDir string
-	model   string
-	events  chan core.Event
-	chatID  atomic.Value
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	alive   atomic.Bool
+	cmd       string
+	workDir   string
+	model     string
+	agentName string
+	events    chan types.Event
+	chatID    atomic.Value
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	alive     atomic.Bool
 }
 
 // 创建一个新的opencodeSession
-func newOpencodeSession(ctx context.Context, cmd, workDir, model, resumeID string) (*opencodeSession, error) {
+func newOpencodeSession(ctx context.Context, cmd, workDir, model, agentName, resumeID string) (*opencodeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	s := &opencodeSession{
-		cmd:     cmd,
-		workDir: workDir,
-		model:   model,
-		events:  make(chan core.Event, 64),
-		ctx:     sessionCtx,
-		cancel:  cancel,
+		cmd:       cmd, // opencode
+		workDir:   workDir,
+		model:     model,
+		agentName: agentName,
+		events:    make(chan types.Event, 64),
+		ctx:       sessionCtx,
+		cancel:    cancel,
 	}
 	s.alive.Store(true)
 
-	if resumeID != "" && resumeID != core.ContinueSession {
+	if resumeID != "" && resumeID != session.ContinueSession {
 		s.chatID.Store(resumeID)
 	}
 	return s, nil
 }
 
 // 发送用户信息(可带有图片和文件)来运行agent 进程
-func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
+func (s *opencodeSession) Send(prompt string, images []types.ImageAttachment, files []types.FileAttachment) error {
 	// 获取file路径和prompt
 	// if len(files) > 0 {
 	// 	filePaths := core.SaveFilesToDisk(s.workDir, files)
@@ -64,9 +67,11 @@ func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment, fil
 	isResume := chatID != ""
 	// 构建命令行
 	args := []string{"run", "--format", "json"}
-
 	if isResume {
 		args = append(args, "--session", chatID)
+	}
+	if s.agentName != "" {
+		args = append(args, "--agent", s.agentName)
 	}
 	if s.workDir != "" {
 		args = append(args, "--dir", s.workDir)
@@ -90,11 +95,13 @@ func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment, fil
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
+	// 执行命令
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("opencodeSession: start: %w", err)
 	}
 
 	s.wg.Add(1)
+	// 循环读取协程
 	go s.readLoop(cmd, stdout, &stderrBuf)
 
 	return nil
@@ -107,7 +114,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 			stderrMsg := stderrBuf.String()
 			if stderrMsg != "" {
 				slog.Error("opencodeSession: process failed", "error", err, "stderr", stderrMsg)
-				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+				evt := types.Event{Type: types.EventError, Error: fmt.Errorf("%s", stderrMsg)}
 				select {
 				case s.events <- evt:
 				case <-s.ctx.Done():
@@ -136,7 +143,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 
 	if err := scanner.Err(); err != nil {
 		slog.Error("opencodeSession: scanner error", "error", err)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
+		evt := types.Event{Type: types.EventError, Error: fmt.Errorf("read stdout: %w", err)}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
@@ -146,7 +153,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 
 	// 所有步骤结束之后触发EventResult 处理最终写入
 	sid := s.CurrentSessionID()
-	evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true}
+	evt := types.Event{Type: types.EventResult, SessionID: sid, Done: true}
 	select {
 	case s.events <- evt:
 	case <-s.ctx.Done():
@@ -178,7 +185,7 @@ func (s *opencodeSession) handleText(raw map[string]any) {
 	}
 	text, _ := part["text"].(string)
 	if text != "" {
-		evt := core.Event{Type: core.EventText, Content: text}
+		evt := types.Event{Type: types.EventText, Content: text}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
@@ -188,12 +195,12 @@ func (s *opencodeSession) handleText(raw map[string]any) {
 }
 
 // 空操作， OpenCode 处理内部处理权限
-func (s *opencodeSession) RespondPermission(_ string, _ core.PermissionResult) error {
+func (s *opencodeSession) RespondPermission(_ string, _ types.PermissionResult) error {
 	return nil
 }
 
 // 返回触发agent事件的channel (在truns之间保持打开)
-func (s *opencodeSession) Events() <-chan core.Event {
+func (s *opencodeSession) Events() <-chan types.Event {
 	return s.events
 }
 

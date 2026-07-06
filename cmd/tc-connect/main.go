@@ -13,6 +13,9 @@ import (
 	"strings"
 	"syscall"
 	"tc-connect/config"
+	"tc-connect/core/cron"
+	"tc-connect/core/i18n"
+	"tc-connect/core/types"
 	"time"
 
 	"tc-connect/core"
@@ -36,7 +39,7 @@ func main() {
 	flag.Usage = printUsage
 	flag.Parse()
 
-	core.VersionInfo = fmt.Sprintf("cc-connect %s\ncommit: %s\nbuilt: %s", version, commit, buildTime)
+	types.VersionInfo = fmt.Sprintf("cc-connect %s\ncommit: %s\nbuilt: %s", version, commit, buildTime)
 
 	initConfigPath(*configFlag)
 	configPath := config.ConfigPath
@@ -100,18 +103,18 @@ func main() {
 	sessionFile := sessionStorePath(cfg.DataDir, proj.Name, effectiveWorkDir)
 
 	// 解析语言
-	var lang core.Language
+	var lang i18n.Language
 	switch cfg.Language {
 	case "zh", "chinese":
-		lang = core.LangChinese
+		lang = i18n.LangChinese
 	case "zh-TW", "zh_TW", "zhtw":
-		lang = core.LangTraditionalChinese
+		lang = i18n.LangTraditionalChinese
 	case "ja", "japanese":
-		lang = core.LangJapanese
+		lang = i18n.LangJapanese
 	case "en", "english":
-		lang = core.LangEnglish
+		lang = i18n.LangEnglish
 	default:
-		lang = core.LangAuto
+		lang = i18n.LangAuto
 	}
 
 	//  创建engine
@@ -151,32 +154,32 @@ func main() {
 	// Wire sender injection
 
 	// 设置回调用于自动识别语言
-	if lang == core.LangAuto {
-		engine.SetLanguageSaveFunc(func(l core.Language) error {
+	if lang == i18n.LangAuto {
+		engine.SetLanguageSaveFunc(func(l i18n.Language) error {
 			return config.SaveLanguage(string(l))
 		})
 	}
 	// Wire 配置重加载
 	capturedEngine := engine
 	capturedProjName := proj.Name
-	engine.SetConfigReloadFunc(func() (*core.ConfigReloadResult, error) {
+	engine.SetConfigReloadFunc(func() (*types.ConfigReloadResult, error) {
 		return reloadConfig(configPath, capturedProjName, capturedEngine)
 	})
 
 	// Wire /web command callbacks
 
 	// 开启定时任务
-	cronStore, err := core.NewCronStore(cfg.DataDir)
+	cronStore, err := cron.NewCronStore(cfg.DataDir)
 	if err != nil {
 		slog.Warn("cron store unavailable", "error", err)
 	}
-	var cronSched *core.CronScheduler
+	var cronSched *cron.CronScheduler
 	if cronStore != nil {
-		cronSched = core.NewCronScheduler(cronStore)
+		cronSched = cron.NewCronScheduler(cronStore)
 		if cfg.Cron.Silent != nil && *cfg.Cron.Silent {
 			cronSched.SetDefaultSilent(true)
 		}
-		cronSched.RegisterEngine(cfg.Project.Name, engine)
+		cronSched.RegisterExecutor(engine)
 		engine.SetCronScheduler(cronSched)
 	}
 
@@ -302,7 +305,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	var restartReq *core.RestartRequest
+	var restartReq *types.RestartRequest
 	select {
 	case <-sigCh:
 	case req := <-core.RestartCh:
@@ -411,13 +414,13 @@ func projectStatePath(dataDir, projectName string) string {
 }
 
 // 从store中 获取要override的工作路径，应用修改
-func applyProjectStateOverride(projectName string, agent core.Agent, configuredWorkDir string, store *core.ProjectStateStore) string {
+func applyProjectStateOverride(projectName string, agent types.Agent, configuredWorkDir string, store *core.ProjectStateStore) string {
 	effectiveWorkDir := configuredWorkDir
 	if store == nil {
 		return effectiveWorkDir
 	}
 	// 判断agent是否实现了WorkDirSwitcher
-	switcher, ok := agent.(core.WorkDirSwitcher)
+	switcher, ok := agent.(types.WorkDirSwitcher)
 	if !ok {
 		return effectiveWorkDir
 	}
@@ -522,13 +525,13 @@ func buildAgentOptions(dataDir string, proj config.ProjectConfig) map[string]any
 	return opts
 }
 
-func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
+func reloadConfig(configPath, projName string, engine *core.Engine) (*types.ConfigReloadResult, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
 
-	result := &core.ConfigReloadResult{}
+	result := &types.ConfigReloadResult{}
 
 	// Find the matching project
 	var proj *config.ProjectConfig
@@ -539,7 +542,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	// Reload display config (includes legacy quiet → display mapping)
 	tm, tool, tmlen, toollen := config.EffectiveDisplay(cfg, proj)
-	engine.SetDisplayConfig(core.DisplayCfg{
+	engine.SetDisplayConfig(types.DisplayCfg{
 		ThinkingMessages: tm,
 		ThinkingMaxLen:   tmlen,
 		ToolMaxLen:       toollen,

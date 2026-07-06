@@ -1,12 +1,15 @@
 package core
 
-import "fmt"
+import (
+	"fmt"
+	"tc-connect/core/types"
+)
 
 // AgentFactory creates an Agent from config options
-type AgentFactory func(opts map[string]any) (Agent, error)
+type AgentFactory func(opts map[string]any) (types.Agent, error)
 
 // 从options中创建AgentFactory
-type PlatformFactory func(opts map[string]any) (Platform, error)
+type PlatformFactory func(opts map[string]any) (types.Platform, error)
 
 var (
 	agentFactories    = make(map[string]AgentFactory)
@@ -22,7 +25,7 @@ func RegisterAgent(name string, factory AgentFactory) {
 }
 
 // 根据传入的平台名找到对应创建方法并执行
-func CreatePlatform(name string, opts map[string]any) (Platform, error) {
+func CreatePlatform(name string, opts map[string]any) (types.Platform, error) {
 	f, ok := platformFactories[name]
 	if !ok {
 		available := make([]string, 0, len(platformFactories))
@@ -35,7 +38,7 @@ func CreatePlatform(name string, opts map[string]any) (Platform, error) {
 }
 
 // 传入agent名称(opencode, cc ...) 由对应的工厂类
-func CreateAgent(name string, opts map[string]any) (Agent, error) {
+func CreateAgent(name string, opts map[string]any) (types.Agent, error) {
 	// 获取创建方法
 	f, ok := agentFactories[name]
 	if !ok {

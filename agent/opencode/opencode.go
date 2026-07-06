@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"tc-connect/core"
+	"tc-connect/core/types"
 	"time"
 )
 
@@ -29,7 +30,7 @@ type Agent struct {
 	mu         sync.RWMutex
 }
 
-func New(opts map[string]any) (core.Agent, error) {
+func New(opts map[string]any) (types.Agent, error) {
 	workDir, _ := opts["wordir"].(string)
 	if workDir == "" {
 		workDir = "."
@@ -48,12 +49,13 @@ func New(opts map[string]any) (core.Agent, error) {
 func (a *Agent) Name() string { return "opencode" }
 
 // 运行`opencode session list` 解析json输出
-func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
+// 暂不考虑复杂的ctx
+func (a *Agent) ListSessions() ([]types.AgentSessionInfo, error) {
 	return listOpencodeSessions(a.cmd, a.workDir)
 }
 
-// 通过`opencode session delete <id>` 删除session  
-func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
+// 通过`opencode session delete <id>` 删除session
+func (a *Agent) DeleteSession(sessionID string) error {
 	a.mu.RLock()
 	cmd := a.cmd
 	workDir := a.workDir
@@ -67,7 +69,6 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	return nil
 }
 
-
 func (a *Agent) SetSessionEnv(env []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -76,7 +77,7 @@ func (a *Agent) SetSessionEnv(env []string) {
 
 func (a *Agent) Stop() error { return nil }
 
-// 2026.5.25 Opencode不支持 /compact
+// 2026.6.26 Opencode 1.16.2不支持 命令行中使用"opencode compact"
 // func (a *Agent) CompressCommand() string { return "/compact" }
 
 // ========================== 公共方法:: Mode切换 ==========================
@@ -94,8 +95,8 @@ func (a *Agent) GetMode() string {
 	return a.mode
 }
 
-func (a *Agent) PermissionModes() []core.PermissionModeInfo {
-	return []core.PermissionModeInfo{
+func (a *Agent) PermissionModes() []types.PermissionModeInfo {
+	return []types.PermissionModeInfo{
 		{Key: "default", Name: "Default", NameZh: "默认", Desc: "Standard mode", DescZh: "标准模式"},
 		{Key: "yolo", Name: "YOLO", NameZh: "全自动", Desc: "Auto-approve all tool calls", DescZh: "自动批准所有工具调用"},
 	}
@@ -106,12 +107,12 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 // ========================== 公共方法:: Session 相关 ==========================
 
 // 创建或回复一个交互session
-func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
+func (a *Agent) StartSession(ctx context.Context, sessionID, agentName string) (types.AgentSession, error) {
 	a.mu.Lock()
 	model := a.model
 	cmd := a.cmd
 	workDir := a.workDir
-	return newOpencodeSession(ctx, cmd, workDir, model, sessionID)
+	return newOpencodeSession(ctx, cmd, workDir, model, agentName, sessionID)
 }
 
 // `opencode session list`命令输出中的一个session.
@@ -121,7 +122,6 @@ type opencodeSessionEntry struct {
 	Updated int64  `json:"updated"` // Unix timestamp in milliseconds
 	Created int64  `json:"created"`
 }
-
 
 // ========================== 公共方法:: MemoryFileProvider 相关 ==========================
 func (a *Agent) ProjectMemoryFile() string {
@@ -143,7 +143,7 @@ func (a *Agent) GlobalMemoryFile() string {
 // ========================== 辅助方法 ==========================
 
 // 运行`opencode session list` 解析json输出
-func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) {
+func listOpencodeSessions(cmd, workDir string) ([]types.AgentSessionInfo, error) {
 	// 执行命令
 	c := exec.Command(cmd, "session", "list", "--format", "json")
 	c.Dir = workDir
@@ -160,9 +160,9 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 
 	msgCounts := querySessionMessageCounts()
 
-	var sessions []core.AgentSessionInfo
+	var sessions []types.AgentSessionInfo
 	for _, e := range entries {
-		sessions = append(sessions, core.AgentSessionInfo{
+		sessions = append(sessions, types.AgentSessionInfo{
 			ID:           e.ID,
 			Summary:      e.Title,
 			MessageCount: msgCounts[e.ID],

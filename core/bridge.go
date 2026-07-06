@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"tc-connect/core/types"
 
 	"github.com/gorilla/websocket"
 )
@@ -231,13 +232,13 @@ func (bs *BridgeServer) authenticate(r *http.Request) bool {
 type BridgePlatform struct {
 	server  *BridgeServer
 	project string
-	handler MessageHandler
+	handler types.MessageHandler
 }
 
 func (bp *BridgePlatform) Name() string { return "bridge" }
 
 // 注册处理方法
-func (bp *BridgePlatform) Start(handler MessageHandler) error {
+func (bp *BridgePlatform) Start(handler types.MessageHandler) error {
 	bp.handler = handler
 	return nil
 }

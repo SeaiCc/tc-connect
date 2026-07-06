@@ -1,8 +1,8 @@
 package feishu
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"tc-connect/core"
+	"tc-connect/core/types"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -113,7 +114,7 @@ type feishuPreviewHandle struct {
 // ==================== Feishu Platform  ====================
 
 func init() {
-	core.RegisterPlatform("feishu", func(opts map[string]any) (core.Platform, error) {
+	core.RegisterPlatform("feishu", func(opts map[string]any) (types.Platform, error) {
 		return newPlatform("feishu", lark.FeishuBaseUrl, opts)
 	})
 }
@@ -136,7 +137,7 @@ type Platform struct {
 	appSecret             string
 	progressStyle         string
 	useInteractiveCard    bool // 使用交互卡片
-	self                  core.Platform
+	self                  types.Platform
 	reactionEmoji         string
 	shareSessionInChannel bool
 	threadIsolation       bool
@@ -150,8 +151,8 @@ type Platform struct {
 	cancel         context.CancelFunc
 	dedup          core.MessageDedup
 
-	handler        core.MessageHandler
-	cardNavHandler core.CardNavigationHandler
+	handler        types.MessageHandler
+	cardNavHandler types.CardNavigationHandler
 
 	botOpenID     string
 	userNameCache sync.Map // open_id -> display name
@@ -163,7 +164,7 @@ type Platform struct {
 
 type feishuRequestFunc func(client *lark.Client, options ...larkcore.RequestOptionFunc) error
 
-func newPlatform(name, domain string, opts map[string]any) (core.Platform, error) {
+func newPlatform(name, domain string, opts map[string]any) (types.Platform, error) {
 	// 解析 app_id | app_secret | domain
 	appID, _ := opts["app_id"].(string)
 	appSecret, _ := opts["app_secret"].(string)
@@ -224,7 +225,7 @@ func (p *Platform) KeepPreviewOnFinish() bool {
 }
 
 // 赋值handler 启动服务
-func (p *Platform) Start(handler core.MessageHandler) error {
+func (p *Platform) Start(handler types.MessageHandler) error {
 	// 设置messageHandler
 	p.handler = handler
 
@@ -306,7 +307,7 @@ func (p *Platform) Stop() error {
 	return nil
 }
 
-func (p *Platform) SetCardNavigationHandler(h core.CardNavigationHandler) {
+func (p *Platform) SetCardNavigationHandler(h types.CardNavigationHandler) {
 	p.cardNavHandler = h
 }
 
@@ -337,6 +338,46 @@ func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 	}
 }
 
+// UpdateProgress 更新进度卡片（用于长任务如多 Agent 编排）
+func (p *interactivePlatform) UpdateProgress(ctx context.Context, rctx any, progress int, total int, message string) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+
+	// 构建进度卡片
+	card := p.buildProgressCard(progress, total, message)
+
+	// 发送卡片（作为新消息或回复）
+	if !p.shouldUseThreadOrReplyAPI(rc) {
+		if rc.chatID == "" {
+			return fmt.Errorf("%s: chatID is empty, cannot send progress", p.tag())
+		}
+		return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, renderCard(card, rc.sessionKey), "update progress")
+	}
+	return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, renderCard(card, rc.sessionKey))
+}
+
+// SendErrorCard 发送错误告警卡片
+func (p *interactivePlatform) SendErrorCard(ctx context.Context, rctx any, title string, errorDetail string, suggestions []string) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+
+	// 构建错误卡片
+	card := p.buildErrorCard(title, errorDetail, suggestions)
+
+	// 发送卡片
+	if !p.shouldUseThreadOrReplyAPI(rc) {
+		if rc.chatID == "" {
+			return fmt.Errorf("%s: chatID is empty, cannot send error card", p.tag())
+		}
+		return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, renderCard(card, rc.sessionKey), "send error card")
+	}
+	return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, renderCard(card, rc.sessionKey))
+}
+
 // 移除review消息,这样调用这可以发送一个分离的最终消息而不会留下一张过时的互动卡片
 func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) error {
 	if !p.useInteractiveCard {
@@ -365,7 +406,64 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 	})
 }
 
-func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachment) error {
+// buildProgressCard 构建进度卡片
+func (p *Platform) buildProgressCard(progress int, total int, message string) *types.Card {
+	percent := 0
+	if total > 0 {
+		percent = (progress * 100) / total
+	}
+
+	statusEmoji := "🔄"
+	if progress >= total {
+		statusEmoji = "✅"
+	}
+
+	card := types.NewCard()
+	card.Title(fmt.Sprintf("%s 多 Agent 编排进行中", statusEmoji), "blue")
+
+	// 进度文本
+	progressText := fmt.Sprintf("**当前进度**: %d / %d (%d%%)\n\n**当前步骤**: %s", progress, total, percent, message)
+	card.Markdown(progressText)
+
+	// 进度条（使用字符模拟）
+	barWidth := 20
+	filled := (progress * barWidth) / total
+	bar := "[" + strings.Repeat("█", filled) + strings.Repeat("·", barWidth-filled) + "]"
+	card.Note(bar)
+
+	return card.Build()
+}
+
+// buildErrorCard 构建错误告警卡片
+func (p *Platform) buildErrorCard(title string, errorDetail string, suggestions []string) *types.Card {
+	card := types.NewCard()
+	card.Title("❌ 编排执行失败", "red")
+
+	// 错误标题
+	if title != "" {
+		card.Markdown(fmt.Sprintf("**错误类型**: %s", title))
+	}
+
+	// 错误详情
+	if errorDetail != "" {
+		card.Divider()
+		errorContent := fmt.Sprintf("**错误详情**:\n\n```\n%s\n```", errorDetail)
+		card.Markdown(errorContent)
+	}
+
+	// 建议操作
+	if len(suggestions) > 0 {
+		card.Divider()
+		card.Markdown("**建议操作**:")
+		for i, sug := range suggestions {
+			card.Markdown(fmt.Sprintf("%d. %s", i+1, sug))
+		}
+	}
+
+	return card.Build()
+}
+
+func (p *Platform) SendFile(ctx context.Context, rctx any, file types.FileAttachment) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: SendFile: invalid reply context type %T", p.tag(), rctx)
@@ -459,7 +557,7 @@ func buildReplyContent(content string) (msgType string, body string) {
 	return larkim.MsgTypePost, buildPostMdJSON(content)
 }
 
-func (p *Platform) dispatchPlatform() core.Platform {
+func (p *Platform) dispatchPlatform() types.Platform {
 	if p.self != nil {
 		return p.self
 	}
@@ -641,8 +739,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	}
 	chatName := p.resolveChatName(chatID)
 
-	// If this message is a reply to another message, fetch the quoted content
-	// and prepend it so the agent has full context.
+	// 如果此消息引用了另外的消息，将引用消息添加至头部，组成完整的消息
 	quotedPrefix := ""
 	if parentID != "" {
 		quotedPrefix = p.fetchQuotedMessage(ctx, parentID)
@@ -666,7 +763,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			)
 			return
 		}
-		p.handler(p.dispatchPlatform(), &core.Message{
+		p.handler(p.dispatchPlatform(), &types.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -948,6 +1045,7 @@ func (p *Platform) withTransientRetry(ctx context.Context, operation string, fn 
 
 // TODO: 会话密钥推导和回复线程行为在此处被拆分到多个代码路径中。
 // 在不改变 thread_isolation=false 的行为的前提下，应重新审视线程/根处理。
+// sessionKey 是由 p.PlatformName + chatID + userID生成的唯一key
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
 	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
 		rootID := stringValue(msg.RootId)
@@ -1109,7 +1207,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		if strings.HasPrefix(actionVal, "act:/model ") {
 			cmdText := strings.TrimPrefix(actionVal, "act:")
 			rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-			go p.handler(p.dispatchPlatform(), &core.Message{
+			go p.handler(p.dispatchPlatform(), &types.Message{
 				SessionKey: sessionKey,
 				Platform:   p.platformName,
 				UserID:     userID,
@@ -1159,7 +1257,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		}
 
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-		go p.handler(p.dispatchPlatform(), &core.Message{
+		go p.handler(p.dispatchPlatform(), &types.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
@@ -1175,7 +1273,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		if permColor == "" {
 			permColor = "green"
 		}
-		cb := core.NewCard().Title(permLabel, permColor)
+		cb := types.NewCard().Title(permLabel, permColor)
 		if permBody != "" {
 			cb.Markdown(permBody)
 		}
@@ -1190,7 +1288,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	// askq: — AskUserQuestion option selected, forward as user message
 	if strings.HasPrefix(actionVal, "askq:") {
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-		go p.handler(p.dispatchPlatform(), &core.Message{
+		go p.handler(p.dispatchPlatform(), &types.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
@@ -1205,7 +1303,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		if answerLabel == "" {
 			answerLabel = actionVal
 		}
-		cb := core.NewCard().Title("✅ "+answerLabel, "green")
+		cb := types.NewCard().Title("✅ "+answerLabel, "green")
 		if askqQuestion != "" {
 			cb.Markdown(askqQuestion)
 		}
@@ -1225,7 +1323,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 
 		slog.Info(p.tag()+": card action dispatched as command", "cmd", cmdText, "user", userID)
 
-		go p.handler(p.dispatchPlatform(), &core.Message{
+		go p.handler(p.dispatchPlatform(), &types.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
@@ -1281,7 +1379,7 @@ func (p *Platform) onBotMenu(event *larkapplication.P2BotMenuV6) error {
 	userName := p.resolveUserName(userID)
 	sessionKey := p.platformName + ":" + userID + ":" + userID
 
-	p.handler(p.dispatchPlatform(), &core.Message{
+	p.handler(p.dispatchPlatform(), &types.Message{
 		SessionKey: sessionKey,
 		Platform:   p.platformName,
 		Content:    content,

@@ -15,8 +15,8 @@ type rateBucket struct {
 // 实现了一个per-key 滑动窗口速率控制, 追踪key的时间戳,
 // 拒绝在时间窗口内配置的请求限制
 type RateLimiter struct {
-	mu sync.Mutex
-	buckets map[string]*rateBucket
+	mu          sync.Mutex
+	buckets     map[string]*rateBucket
 	maxMessages int
 	windowMs    int64
 	stopCh      chan struct{}
@@ -64,7 +64,6 @@ func (rl *RateLimiter) Stop() {
 	}
 }
 
-
 type tokenBucket struct {
 	tokens     float64
 	maxTokens  float64
@@ -110,7 +109,7 @@ type OutgoingRateLimiter struct {
 	mu       sync.Mutex
 	bucket   *tokenBucket
 	defaults OutgoingRateLimitCfg
-	// overrides map[string]OutgoingRateLimitCfg // 目前只考虑一个平台
+	// overrides map[string]OutgoingRateLimitCfg // 目前只所有平台统一配置
 
 }
 
