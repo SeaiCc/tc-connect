@@ -13,11 +13,10 @@ language = "zh"
       work_dir = "/media/ubuntu/data/gitSourceCode/AIWorkflow/tc-connect-playground"
 
   [project.platform]
-    type = "qq"
+    type = "feishu"
     [project.platform.options]
-      ws_url = "ws://127.0.0.1:3001"  # NapCat 正向 WebSocket 地址
-      token = "7AOJa_Nt4cX.NJe1"           # 可选：Access Token（需与 NapCat 一致）
-      allow_from = "*"                 # 允许交互的 QQ 号，"*" 表示所有人
+      app_id = "cli_a9527dd0ee3a5cb2"
+      app_secret = "WbfYjlq7Udftt9TANWIeqccyFJnfAkR3"
 
 [log]
   level = "debug"

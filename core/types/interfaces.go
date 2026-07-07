@@ -77,6 +77,11 @@ type FileSender interface {
 	SendFile(ctx context.Context, replyCtx any, file FileAttachment) error
 }
 
+// 平台支持发送音频接口
+type ImageSender interface {
+	SendImage(ctx context.Context, replyCtx any, img ImageAttachment) error
+}
+
 // ======================== Platform - Card ========================
 
 // 被平台调用来原地渲染一个卡片 (e.g. Feishu card.action.trigger callback)

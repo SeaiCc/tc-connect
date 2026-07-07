@@ -43,6 +43,14 @@ type FileAttachment struct {
 	FileName string // 文件名
 }
 
+// 用户发送的音频文件
+type AudioAttachment struct {
+	MimeType string // e.g. "audio/amr", "audio/ogg", "audio/mp4"
+	Data     []byte // raw audio bytes
+	Format   string // short format hint: "amr", "ogg", "m4a", "mp3", "wav", etc.
+	Duration int    // 持续时间 (if known)
+}
+
 // 保存文件attachments 到 .tc-connect/attachments/ 并返回据对路径列表
 // Agents 能在prompts中引用这些路径，CLI可使用内置的工具读取
 func SaveFilesToDisk(workDir string, files []FileAttachment) []string {
@@ -160,4 +168,14 @@ type AgentSessionInfo struct {
 	MessageCount int
 	ModifiedAt   time.Time
 	GitBranch    string
+}
+
+// CheckAllowFrom logs a security warning at startup when allow_from is not
+// configured (defaults to permit-all). Platforms should call this during init.
+func CheckAllowFrom(platform, allowFrom string) {
+	if strings.TrimSpace(allowFrom) == "" {
+		slog.Warn("allow_from is not set — all users are permitted. "+
+			"Set allow_from in config to restrict access.",
+			"platform", platform)
+	}
 }
